@@ -1,0 +1,4 @@
+node_modules/
+.reelnote/
+*.log
+.DS_Store

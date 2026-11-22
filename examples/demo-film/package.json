@@ -1,0 +1,20 @@
+{
+  "name": "reelnote-demo-film",
+  "private": true,
+  "description": "A tiny Remotion project to try ReelNote on. It has a black frame at 40 and a stutter at 60 in Tests/Glitchy, and a silent gap in Intro's sound.",
+  "scripts": {
+    "review": "node ../../dist/cli.js",
+    "studio": "remotion studio"
+  },
+  "dependencies": {
+    "@remotion/cli": "^4.0.0",
+    "@remotion/player": "^4.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "remotion": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "typescript": "^5.7.0"
+  }
+}
