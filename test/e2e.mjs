@@ -4,7 +4,7 @@
 // renders Tests/Glitchy and checks the frame check finds its black frame and stutter, builds Intro's sound.
 import { spawn } from "node:child_process";
 import http from "node:http";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
@@ -75,6 +75,15 @@ const note = await api("notes", { composition: first.id, frame: mid, text: "e2e:
 ok(existsSync(join(ROOT, ".reelnote", note.image)) && existsSync(join(ROOT, ".reelnote", note.clean)), `note #${note.id} saved with two pictures`);
 const sound = await api("notes", { composition: first.id, frame: 0, endFrame: 20, kind: "audio", text: "e2e: music too loud" });
 ok(sound.kind === "audio" && sound.endFrame === 20 && sound.marks.length === 0, "sound note over a range");
+ok(sound.strip && existsSync(join(ROOT, ".reelnote", sound.strip)), "a range note gets a filmstrip");
+
+console.log("props");
+await api("props", { composition: first.id, props: { e2eProp: "x" } }, "PUT");
+ok((await api("props"))[first.id]?.e2eProp === "x", "props are saved");
+const withProps = await api("notes", { composition: first.id, frame: 1, text: "e2e: with props" });
+ok(withProps.props?.e2eProp === "x", "a note remembers the props it was seen with");
+await api("props", { composition: first.id, props: {} }, "PUT");
+ok(!(first.id in (await api("props"))), "props reset");
 
 console.log("mcp");
 const mcp = spawn(process.execPath, [CLI, "mcp", "--project", ROOT], { stdio: ["pipe", "pipe", "ignore"] });
@@ -104,9 +113,27 @@ r = await tool("reelnote_compare", { id: note.id });
 ok(!r.isError && imgs(r) === 2, "reelnote_compare returns before and now");
 r = await tool("reelnote_frame", { composition: "does-not-exist", frame: 1 });
 ok(r.isError && /No composition called/.test(txt(r)), "unknown composition is a clear error");
+r = await tool("reelnote_strip", { composition: first.id, from: 0, to: Math.min(30, first.durationInFrames - 1), count: 6 });
+ok(!r.isError && imgs(r) === 1 && /frames 0, /.test(txt(r)), "reelnote_strip returns a filmstrip");
+r = await tool("reelnote_note", { id: sound.id });
+ok(imgs(r) === 2, "reelnote_note shows the filmstrip of a range note");
 r = await tool("reelnote_reply", { id: note.id, text: "Bigger how much?" });
+// a code change while working on the note is recorded, shown and can be undone
+const entryFile = join(ROOT, "src", existsSync(join(ROOT, "src", "Root.tsx")) ? "Root.tsx" : "index.ts");
+const original = readFileSync(entryFile, "utf8");
+appendFileSync(entryFile, "\n// e2e change\n");
 r = await tool("reelnote_note_update", { id: note.id, status: "fixed", reply: "Doubled it" });
-ok(/is fixed/.test(txt(r)), "reelnote_note_update marks it fixed");
+ok(/is fixed/.test(txt(r)) && txt(r).includes("Recorded changes: src/"), `reelnote_note_update records the change (${txt(r)})`);
+r = await tool("reelnote_changes", { id: note.id });
+ok(txt(r).includes("+// e2e change"), "reelnote_changes shows the diff");
+const ch = await api(`notes/${note.id}/changes`);
+ok(ch.files.length === 1 && ch.files[0].added >= 1, "the window can show the change");
+await api(`notes/${note.id}/undo`, {});
+ok(readFileSync(entryFile, "utf8") === original, "undo puts the file back exactly");
+const undone = (await api("notes")).find((n) => n.id === note.id);
+ok(undone.status === "open" && undone.fix.undone, "undo reopens the note");
+writeFileSync(entryFile, original);
+r = await tool("reelnote_note_update", { id: note.id, status: "fixed", reply: "Doubled it" });
 r = await tool("reelnote_compositions");
 ok(txt(r).includes(first.id), "reelnote_compositions");
 
@@ -134,6 +161,11 @@ if (hasGlitchy && done?.video) {
 }
 r = await tool("reelnote_render_status");
 ok(/Done/.test(txt(r)), "reelnote_render_status reports the result");
+// render again: the first render is kept and the two are compared
+await api("render", { composition: target });
+st = await until((x) => x.history.filter((h) => h.composition === target && h.kind === "video").length >= 2, 300000);
+r = await tool("reelnote_render_diff", { composition: target });
+ok(/No frames changed/.test(txt(r)), `reelnote_render_diff compares two renders (${txt(r).split("\n").pop()})`);
 
 if (comps.some((c) => c.id === "Intro")) {
   console.log("sound");
@@ -141,9 +173,34 @@ if (comps.some((c) => c.id === "Intro")) {
   st = await until((x) => x.history.some((h) => h.composition === "Intro" && h.kind === "waveform"), 180000);
   r = await tool("reelnote_audio", { composition: "Intro" });
   ok(/Silence for 1\.0 s/.test(txt(r)), "reelnote_audio finds the silent gap");
+  ok(/LUFS/.test(txt(r)), "reelnote_audio gives loudness in LUFS");
   const w = await api("waveform?composition=Intro");
   ok(w.peaks.length === 150, "waveform has one value per frame");
 }
+
+console.log("share");
+const sh = await api("share", { on: true });
+ok(sh.on && sh.port, `sharing starts (${sh.urls[0] ?? "no network address here"})`);
+const shareKey = sh.urls[0] ? new URL(sh.urls[0]).searchParams.get("k") : null;
+if (sh.urls[0]) {
+  const base = new URL(sh.urls[0]).origin;
+  ok((await fetch(`${base}/`)).status === 401, "the share link needs its key");
+  const page = await fetch(sh.urls[0]);
+  ok(page.status === 200 && /rn_k=/.test(page.headers.get("set-cookie") ?? "") && (await page.text()).includes('"role":"reviewer"'), "the key opens the reviewer page");
+  const rapi = async (path, body, method) => fetch(`${base}/__rn/api/${path}`, { method: method ?? (body ? "POST" : "GET"), headers: { "Content-Type": "application/json", "x-reelnote-token": shareKey }, body: body ? JSON.stringify(body) : undefined });
+  ok((await rapi("notes")).status === 200, "a reviewer can read notes");
+  ok((await rapi("render", { composition: target })).status === 403, "a reviewer can't render");
+  ok((await rapi("cleanup", {})).status === 403, "a reviewer can't clean up");
+  ok((await rapi(`notes/${note.id}`, undefined, "DELETE")).status === 403, "a reviewer can't delete notes");
+  const rn = await (await rapi("notes", { composition: first.id, frame: 2, text: "e2e: from a phone", author: "Rahim" })).json();
+  ok(rn.author === "Rahim", "a reviewer's note carries their name");
+  ok((await fetch(`${base}/__rn/api/state`, { headers: { "x-reelnote-token": s.token } })).status === 401, "the owner's token doesn't work on the share link");
+  r = await tool("reelnote_notes");
+  ok(txt(r).includes("from reviewer Rahim"), "Claude sees who wrote it");
+}
+const off = await api("share", { on: false });
+ok(!off.on, "sharing stops");
+if (sh.urls[0]) ok(await fetch(sh.urls[0]).then(() => false, () => true), "the link stops working");
 
 console.log("report");
 for (const format of ["md", "html", "pdf"]) {

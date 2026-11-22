@@ -1,13 +1,15 @@
 // Report export, clean-up of temporary files, keys and version.
 import React, { useEffect, useState } from "react";
 import { api, boot } from "./api";
+import { copyText } from "./NotesPanel";
+import type { ShareInfo } from "./types";
 import { useT, type Lang } from "./i18n";
 
 const gb = (b: number) => (b > 1073741824 ? `${(b / 1073741824).toFixed(1)} GB` : `${(b / 1048576).toFixed(0)} MB`);
 
 export const KEYS: [string, keyof ReturnType<typeof useT>][] = [
   ["Space", "k_play"], ["← →", "k_step"], ["Shift + ← →", "k_step10"], ["Home / End", "k_home"], ["N", "k_note"], ["A", "k_sound"],
-  ["I / O", "k_io"], ["X", "k_x"], ["1 2 3 4", "k_tools"], ["[ ]", "k_prev"], ["?", "k_help"], ["Esc", "k_esc"],
+  ["I / O", "k_io"], ["X", "k_x"], ["1 2 3 4", "k_tools"], ["[ ]", "k_prev"], ["G", "k_guides"], ["?", "k_help"], ["Esc", "k_esc"],
 ];
 
 export const KeyList: React.FC = () => {
@@ -19,7 +21,34 @@ export const KeyList: React.FC = () => {
   );
 };
 
-export const ToolsPanel: React.FC<{ lang: Lang; toast: (s: string) => void; busy: boolean }> = ({ lang, toast, busy }) => {
+const SharePanel: React.FC<{ share: ShareInfo; toast: (s: string) => void }> = ({ share, toast }) => {
+  const t = useT();
+  const [working, setWorking] = useState(false);
+  const flip = async () => {
+    setWorking(true);
+    await api("share", { body: { on: !share.on } }).catch((e: Error) => toast(e.message));
+    setWorking(false);
+  };
+  return (
+    <div className="sharep">
+      <p className="hint">{t.shareHint}</p>
+      <div className="cleanrow">
+        <span className={share.on ? "ok" : "muted"}>{share.on ? `● ${t.shareOn}` : t.shareOff}</span>
+        <button className={share.on ? "" : "primary"} disabled={working} onClick={flip}>{share.on ? t.shareStop : t.shareStart}</button>
+      </div>
+      {share.on && !share.urls.length && <p className="hint warn">{t.noNetwork}</p>}
+      {share.on && share.urls.map((u) => (
+        <div key={u} className="share-url">
+          <code>{u}</code>
+          <button onClick={async () => toast((await copyText(u)) ? t.copied.split(".")[0] : u)}>{t.copy}</button>
+        </div>
+      ))}
+      {share.on && <p className="hint">{t.shareWin}</p>}
+    </div>
+  );
+};
+
+export const ToolsPanel: React.FC<{ lang: Lang; toast: (s: string) => void; busy: boolean; share: ShareInfo }> = ({ lang, toast, busy, share }) => {
   const t = useT();
   const [format, setFormat] = useState<"md" | "html" | "pdf">("pdf");
   const [rlang, setRlang] = useState<Lang>(lang);
@@ -34,6 +63,8 @@ export const ToolsPanel: React.FC<{ lang: Lang; toast: (s: string) => void; busy
 
   return (
     <div className="toolsp">
+      <h4>{t.share}</h4>
+      <SharePanel share={share} toast={toast} />
       <h4>{t.exportReport}</h4>
       <div className="form">
         <label>{t.format}

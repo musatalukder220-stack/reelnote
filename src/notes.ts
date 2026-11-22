@@ -34,10 +34,16 @@ const normalize = (n: Partial<Note> & Record<string, unknown>): Note => ({
   marks: Array.isArray(n.marks) ? (n.marks as Mark[]) : [],
   image: (n.image as string) ?? null,
   clean: (n.clean as string) ?? null,
+  strip: (n.strip as string) ?? null,
   status: n.status === "fixed" ? "fixed" : "open",
   replies: Array.isArray(n.replies) ? n.replies : [],
   created: String(n.created ?? new Date().toISOString()),
   fixed: (n.fixed as string) ?? null,
+  author: typeof n.author === "string" && n.author ? n.author : null,
+  props: n.props && typeof n.props === "object" ? (n.props as Record<string, unknown>) : null,
+  createdSnap: (n.createdSnap as string) ?? null,
+  baseline: (n.baseline as string) ?? null,
+  fix: (n.fix as Note["fix"]) ?? null,
 });
 
 export const loadNotes = (root: string): Note[] => {
@@ -123,10 +129,13 @@ export const describeMarks = (marks: Mark[]) => (marks.length ? marks.map(descri
 
 export const noteSummary = (n: Note) => {
   const lines = [
-    `#${n.id} · ${n.composition} · ${frameLabel(n.frame, n.endFrame, n.fps)} · ${n.kind === "audio" ? "sound" : "picture"} · ${n.status}`,
+    `#${n.id} · ${n.composition} · ${frameLabel(n.frame, n.endFrame, n.fps)} · ${n.kind === "audio" ? "sound" : "picture"} · ${n.status}${n.author ? ` · from reviewer ${n.author}` : ""}`,
     `   "${n.text}"`,
     `   ${n.kind === "audio" ? "about the sound in this stretch" : describeMarks(n.marks)}${n.width ? ` · composition ${n.width}×${n.height}` : ""}`,
   ];
-  for (const rep of n.replies) lines.push(`   ${rep.by === "claude" ? "Claude" : "User"}: ${rep.text}`);
+  if (n.props && Object.keys(n.props).length) lines.push(`   seen with props changed in ReelNote: ${JSON.stringify(n.props).slice(0, 300)}`);
+  if (n.strip) lines.push(`   has a filmstrip of the range (reelnote_note shows it)`);
+  for (const rep of n.replies) lines.push(`   ${rep.by === "claude" ? "Claude" : n.author && rep.by === "you" ? n.author : "User"}: ${rep.text}`);
+  if (n.fix) lines.push(`   Claude changed: ${n.fix.files.map((f) => `${f.path} (+${f.added} −${f.removed})`).join(", ") || "no files"}${n.fix.undone ? " · the user UNDID this change" : ""}`);
   return lines.join("\n");
 };

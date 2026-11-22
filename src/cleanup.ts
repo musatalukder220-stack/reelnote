@@ -1,12 +1,13 @@
 // Leftovers worth deleting: Remotion's temporary bundles and render folders (left behind when a render is stopped
-// or crashes), the frame pictures made for Claude's checks and the audio files behind waveforms.
+// or crashes), the frame pictures made for Claude's checks, the audio files behind waveforms and the renders kept
+// for comparison.
 // Never touches your renders, your notes or your project.
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, rmSync, statSync } from "node:fs";
 import os from "node:os";
 import { join } from "node:path";
 
-export type Leftover = { kind: "remotion" | "frames" | "audio"; path: string; bytes: number };
+export type Leftover = { kind: "remotion" | "frames" | "audio" | "previous"; path: string; bytes: number };
 
 const sizeOf = (p: string): number => {
   try {
@@ -33,6 +34,8 @@ export const findLeftovers = (dataDir: string, tmp = os.tmpdir()): Leftover[] =>
   if (existsSync(frames)) for (const f of readdirSync(frames)) items.push({ kind: "frames", path: join(frames, f), bytes: sizeOf(join(frames, f)) });
   const audio = join(dataDir, "audio");
   if (existsSync(audio)) for (const f of readdirSync(audio)) if (f.endsWith(".wav")) items.push({ kind: "audio", path: join(audio, f), bytes: sizeOf(join(audio, f)) });
+  const previous = join(dataDir, "previous");
+  if (existsSync(previous)) for (const f of readdirSync(previous)) items.push({ kind: "previous", path: join(previous, f), bytes: sizeOf(join(previous, f)) });
   return items.filter((i) => i.bytes > 0);
 };
 

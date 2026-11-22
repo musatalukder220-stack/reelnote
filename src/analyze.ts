@@ -4,7 +4,7 @@
 //   stutter – a frame identical to the one before it while the picture moves on both sides (a dropped or repeated frame)
 //   frozen  – the picture doesn't change for a long stretch (often on purpose, so only noted)
 //   missing – fewer frames in the file than the composition has
-// Sound: loudness per video frame (this is also the waveform), silent gaps between sounds, and clipping.
+// Sound: level per video frame (this is also the waveform), integrated loudness in LUFS, silent gaps and clipping.
 import { spawn, type ChildProcess } from "node:child_process";
 import type { AudioCheck, Issue, VideoCheck } from "./types.js";
 import { npx, timecode } from "./util.js";
@@ -97,6 +97,38 @@ export class VideoChecker {
 const SILENT = Math.pow(10, -55 / 20);
 const CLIP = 32700 / 32768;
 
+// ITU-R BS.1770 K-weighting (a high shelf, then a high pass), worked out for any sample rate
+// (Brecht De Man's derivation; at 48 kHz it gives the coefficients printed in the standard)
+type Biquad = { b0: number; b1: number; b2: number; a1: number; a2: number };
+export const kWeighting = (fs: number): [Biquad, Biquad] => {
+  let K = Math.tan((Math.PI * 1681.974450955533) / fs);
+  const Q1 = 0.7071752369554196;
+  const Vh = Math.pow(10, 3.999843853973347 / 20), Vb = Math.pow(Vh, 0.4996667741545416);
+  let a0 = 1 + K / Q1 + K * K;
+  const shelf = { b0: (Vh + (Vb * K) / Q1 + K * K) / a0, b1: (2 * (K * K - Vh)) / a0, b2: (Vh - (Vb * K) / Q1 + K * K) / a0, a1: (2 * (K * K - 1)) / a0, a2: (1 - K / Q1 + K * K) / a0 };
+  K = Math.tan((Math.PI * 38.13547087602444) / fs);
+  const Q2 = 0.5003270373238773;
+  a0 = 1 + K / Q2 + K * K;
+  const hp = { b0: 1, b1: -2, b2: 1, a1: (2 * (K * K - 1)) / a0, a2: (1 - K / Q2 + K * K) / a0 };
+  return [shelf, hp];
+};
+
+export const PLATFORM_LUFS = -14; // YouTube, Spotify, TikTok aim about here
+
+export const loudnessIssues = (lufs: number | null, peakDb: number | null, clipped: boolean): Issue[] => {
+  const out: Issue[] = [];
+  if (lufs === null) return out;
+  const down = Math.round((lufs - PLATFORM_LUFS) * 10) / 10;
+  if (lufs > -9) out.push({ level: "warning", kind: "loudness", frame: 0, message: `Very loud: ${lufs} LUFS. YouTube and others will turn it down about ${down} dB, and it may sound squashed. Aim near ${PLATFORM_LUFS} LUFS.` });
+  else if (lufs > -13) out.push({ level: "info", kind: "loudness", frame: 0, message: `${lufs} LUFS: YouTube will turn it down about ${down} dB (target ${PLATFORM_LUFS} LUFS).` });
+  else if (lufs < -20) out.push({ level: "warning", kind: "loudness", frame: 0, message: `Quiet: ${lufs} LUFS. Platforms aim for ${PLATFORM_LUFS} LUFS and YouTube won't turn it up.` });
+  else out.push({ level: "info", kind: "loudness", frame: 0, message: `${lufs} LUFS: a good level for YouTube, Spotify and TikTok (target ${PLATFORM_LUFS}).` });
+  if (!clipped && peakDb !== null && peakDb > -1) out.push({ level: "info", kind: "loudness", frame: 0, message: `Peaks reach ${peakDb} dBFS. Keep them under −1 dBFS so they don't distort after upload.` });
+  return out;
+};
+
+// Reads interleaved 16-bit samples: per-frame peak and loudness (the waveform), silent gaps, clipping,
+// and integrated loudness in LUFS (BS.1770: K-weighted, 400 ms blocks, absolute and relative gates).
 export class AudioAnalyzer {
   peaks: number[] = [];
   rms: number[] = [];
@@ -105,7 +137,16 @@ export class AudioAnalyzer {
   private maxPeak = 0;
   private cur = { peak: 0, sq: 0, n: 0 };
   private carry = 0; // fractional samples per frame
-  constructor(private fps: number, private rate = 8000) {}
+  private filters: [Biquad, Biquad];
+  private state: Float64Array; // per channel: x1 x2 y1 y2 for each of the 2 filters
+  private sub: number[] = []; // K-weighted energy per 100 ms (summed over channels)
+  private subAcc = 0;
+  private subN = 0;
+  private ch = 0;
+  constructor(private fps: number, private rate = 48000, private channels = 2) {
+    this.filters = kWeighting(rate);
+    this.state = new Float64Array(channels * 8);
+  }
 
   private flushFrame() {
     const c = this.cur;
@@ -115,20 +156,52 @@ export class AudioAnalyzer {
   }
 
   pushSamples(s: Int16Array) {
-    const per = this.rate / this.fps;
+    const per = (this.rate / this.fps) * this.channels;
+    const subLen = Math.round(this.rate / 10);
+    const [f1, f2] = this.filters;
+    const st = this.state;
     for (let i = 0; i < s.length; i++) {
-      const v = Math.abs(s[i]) / 32768;
-      if (v > this.cur.peak) this.cur.peak = v;
-      if (v > this.maxPeak) this.maxPeak = v;
+      const v = s[i] / 32768;
+      const a = Math.abs(v);
+      if (a > this.cur.peak) this.cur.peak = a;
+      if (a > this.maxPeak) this.maxPeak = a;
       this.cur.sq += v * v;
       this.cur.n++;
       this.sumSq += v * v;
       this.samples++;
-      if (this.cur.n >= Math.floor(per + this.carry)) {
+      // K-weighting for this channel
+      const o = this.ch * 8;
+      const y1 = f1.b0 * v + f1.b1 * st[o] + f1.b2 * st[o + 1] - f1.a1 * st[o + 2] - f1.a2 * st[o + 3];
+      st[o + 1] = st[o]; st[o] = v; st[o + 3] = st[o + 2]; st[o + 2] = y1;
+      const y2 = f2.b0 * y1 + f2.b1 * st[o + 4] + f2.b2 * st[o + 5] - f2.a1 * st[o + 6] - f2.a2 * st[o + 7];
+      st[o + 5] = st[o + 4]; st[o + 4] = y1; st[o + 7] = st[o + 6]; st[o + 6] = y2;
+      this.subAcc += y2 * y2;
+      if (++this.ch === this.channels) {
+        this.ch = 0;
+        if (++this.subN === subLen) {
+          this.sub.push(this.subAcc / subLen);
+          this.subAcc = 0;
+          this.subN = 0;
+        }
+      }
+      if (this.cur.n >= Math.floor(per + this.carry) && this.ch === 0) {
         this.carry = per + this.carry - this.cur.n;
         this.flushFrame();
       }
     }
+  }
+
+  // integrated loudness, gated as BS.1770-4 describes
+  lufs(): number | null {
+    const blocks: number[] = [];
+    for (let i = 0; i + 4 <= this.sub.length; i++) blocks.push((this.sub[i] + this.sub[i + 1] + this.sub[i + 2] + this.sub[i + 3]) / 4);
+    const L = (z: number) => -0.691 + 10 * Math.log10(z);
+    const abs = blocks.filter((z) => z > 0 && L(z) > -70);
+    if (!abs.length) return null;
+    const rel = L(abs.reduce((a, b) => a + b, 0) / abs.length) - 10;
+    const gated = abs.filter((z) => L(z) > rel);
+    if (!gated.length) return null;
+    return Math.round(L(gated.reduce((a, b) => a + b, 0) / gated.length) * 10) / 10;
   }
 
   finish(): AudioCheck {
@@ -136,6 +209,7 @@ export class AudioAnalyzer {
     const issues: Issue[] = [];
     const loud = this.rms.map((r) => r >= SILENT);
     const first = loud.indexOf(true), last = loud.lastIndexOf(true);
+    let clipped = false;
     if (first >= 0) {
       // gaps of silence between sounds (leading and trailing silence is normal)
       let from: number | null = null;
@@ -152,10 +226,11 @@ export class AudioAnalyzer {
       // clipping: the peak sits at full scale for 2+ frames in a row
       let clipFrom: number | null = null;
       for (let i = 0; i <= this.peaks.length; i++) {
-        const clipped = i < this.peaks.length && this.peaks[i] >= CLIP;
-        if (clipped) clipFrom ??= i;
+        const c = i < this.peaks.length && this.peaks[i] >= CLIP;
+        if (c) clipFrom ??= i;
         else if (clipFrom !== null) {
           if (i - clipFrom >= 2) {
+            clipped = true;
             issues.push({ level: "warning", kind: "clipping", frame: clipFrom, endFrame: i - 1,
               message: `Sound clips (too loud, distorts) at ${timecode(clipFrom, this.fps)}–${timecode(i - 1, this.fps)}` });
           }
@@ -164,9 +239,12 @@ export class AudioAnalyzer {
       }
     }
     const db = (v: number) => (v > 0 ? Math.round(20 * Math.log10(v) * 10) / 10 : null);
+    const lufs = this.lufs();
+    const peakDb = db(this.maxPeak);
     return {
       hasAudio: true, frames: this.peaks.length, fps: this.fps, peaks: this.peaks,
-      rmsDb: this.samples ? db(Math.sqrt(this.sumSq / this.samples)) : null, peakDb: db(this.maxPeak), issues,
+      rmsDb: this.samples ? db(Math.sqrt(this.sumSq / this.samples)) : null, peakDb, lufs,
+      issues: [...loudnessIssues(lufs, peakDb, clipped), ...issues],
     };
   }
 }
@@ -199,7 +277,7 @@ export const checkVideo = (opts: { root: string; file: string; fps: number; expe
 // Remotion's ffmpeg has no raw "s16le" muxer, so the sound comes as a WAV stream: skip its header, then read samples.
 export const analyzeAudio = (opts: { root: string; file: string; fps: number; ffmpeg?: FfmpegRunner }) =>
   new Promise<AudioCheck>((resolve, reject) => {
-    const ff = (opts.ffmpeg ?? remotionFfmpeg)(["-v", "error", "-i", opts.file, "-map", "0:a:0", "-ac", "1", "-ar", "8000", "-c:a", "pcm_s16le", "-flags", "+bitexact", "-map_metadata", "-1", "-f", "wav", "-"], opts.root);
+    const ff = (opts.ffmpeg ?? remotionFfmpeg)(["-v", "error", "-i", opts.file, "-map", "0:a:0", "-ac", "2", "-ar", "48000", "-c:a", "pcm_s16le", "-flags", "+bitexact", "-map_metadata", "-1", "-f", "wav", "-"], opts.root);
     const an = new AudioAnalyzer(opts.fps);
     let head: Buffer | null = Buffer.alloc(0); // until the "data" chunk is found
     let rest: Buffer = Buffer.alloc(0);
@@ -232,7 +310,7 @@ export const analyzeAudio = (opts: { root: string; file: string; fps: number; ff
     ff.on("close", (code) => {
       if (code === 0) return resolve(an.finish());
       if (/matches no streams|does not contain any stream|Stream map/i.test(err)) {
-        return resolve({ hasAudio: false, frames: 0, fps: opts.fps, peaks: [], rmsDb: null, peakDb: null,
+        return resolve({ hasAudio: false, frames: 0, fps: opts.fps, peaks: [], rmsDb: null, peakDb: null, lufs: null,
           issues: [{ level: "info", kind: "no-audio", frame: 0, message: "The file has no sound track" }] });
       }
       reject(new Error(`ffmpeg exited ${code}: ${err.slice(-400)}`));
@@ -252,3 +330,82 @@ export const probeFps = (opts: { root: string; file: string; ffmpeg?: FfmpegRunn
       resolve(m ? Number(m[1]) : null);
     });
   });
+
+// Reads raw 160×90 grey frames from an ffmpeg process, one at a time.
+class FrameReader {
+  private buf: Buffer = Buffer.alloc(0);
+  private done = false;
+  private waiters: (() => void)[] = [];
+  error = "";
+  constructor(private proc: ChildProcess) {
+    proc.stdout!.on("data", (c: Buffer) => {
+      this.buf = this.buf.length ? Buffer.concat([this.buf, c]) : c;
+      if (this.buf.length > SIZE * 60) proc.stdout!.pause(); // don't run ahead of the other file
+      this.wake();
+    });
+    proc.stderr!.on("data", (d) => (this.error += d));
+    proc.on("close", () => {
+      this.done = true;
+      this.wake();
+    });
+    proc.on("error", (e) => {
+      this.error += e.message;
+      this.done = true;
+      this.wake();
+    });
+  }
+  private wake() {
+    const w = this.waiters;
+    this.waiters = [];
+    w.forEach((f) => f());
+  }
+  async next(): Promise<Uint8Array | null> {
+    for (;;) {
+      if (this.buf.length >= SIZE) {
+        const f = Uint8Array.from(this.buf.subarray(0, SIZE));
+        this.buf = this.buf.subarray(SIZE);
+        if (this.buf.length < SIZE * 30) this.proc.stdout!.resume();
+        return f;
+      }
+      if (this.done) return null;
+      this.proc.stdout!.resume();
+      await new Promise<void>((r) => this.waiters.push(r));
+    }
+  }
+}
+
+const greyFrames = (ff: FfmpegRunner, root: string, file: string) =>
+  ff(["-v", "error", "-i", file, "-map", "0:v:0", "-vf", `scale=${W}:${H}:flags=area,format=gray`, "-f", "image2pipe", "-c:v", "rawvideo", "-"], root);
+
+export const CHANGED = 1.2; // average difference (0–255) above which a frame counts as changed (compression noise is lower)
+
+// Compares two renders frame by frame and returns the stretches that changed.
+export const diffVideos = async (opts: { root: string; before: string; after: string; ffmpeg?: FfmpegRunner }) => {
+  const ff = opts.ffmpeg ?? remotionFfmpeg;
+  const a = new FrameReader(greyFrames(ff, opts.root, opts.before));
+  const b = new FrameReader(greyFrames(ff, opts.root, opts.after));
+  const changed: { from: number; to: number; amount: number }[] = [];
+  let i = 0, na = 0, nb = 0;
+  for (;;) {
+    const [fa, fb] = await Promise.all([a.next(), b.next()]);
+    if (fa) na++;
+    if (fb) nb++;
+    if (!fa || !fb) {
+      // drain whichever is longer, just to count
+      while (fa && (await a.next())) na++;
+      while (fb && (await b.next())) nb++;
+      break;
+    }
+    const d = meanAbsDiff(fa, fb);
+    if (d > CHANGED) {
+      const last = changed[changed.length - 1];
+      if (last && i - last.to <= 2) {
+        last.to = i;
+        last.amount = Math.max(last.amount, Math.round(d * 10) / 10);
+      } else changed.push({ from: i, to: i, amount: Math.round(d * 10) / 10 });
+    }
+    i++;
+  }
+  if (!na || !nb) throw new Error(`Couldn't read the videos: ${(a.error || b.error).slice(-300)}`);
+  return { frames: [na, nb] as [number, number], changed };
+};

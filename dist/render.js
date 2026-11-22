@@ -1,6 +1,6 @@
 // "Render once": the real Remotion CLI with safe settings, live progress and memory, then the frame and sound check.
 // A "waveform" job renders only the sound (fast, no pictures) so the timeline can show it.
-import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { analyzeAudio, checkVideo } from "./analyze.js";
 import { autoConcurrency, readMemory } from "./memory.js";
@@ -22,9 +22,11 @@ export const outputPath = (root, dataDir, item) => {
     const suffix = s.range ? `-${s.range[0]}-${s.range[1]}` : "";
     return join(root, "out", `${safeName(item.composition)}${suffix}.${EXT[s.codec]}`);
 };
-export const renderArgs = (entry, item, out, concurrency) => {
+export const renderArgs = (entry, item, out, concurrency, propsFile = null) => {
     const s = item.settings;
     const args = ["remotion", "render", entry, item.composition, out, `--concurrency=${concurrency}`, "--log=info"];
+    if (propsFile)
+        args.push(`--props=${propsFile}`);
     if (item.kind === "waveform") {
         args.push("--codec=wav");
     }
@@ -57,13 +59,32 @@ export const startJob = (opts) => {
     const { root, dataDir, entry, item } = opts;
     const out = outputPath(root, dataDir, item);
     mkdirSync(join(out, ".."), { recursive: true });
+    // keep the render this one replaces, so the two can be compared
+    let previous = null;
+    if (item.kind === "video" && existsSync(out)) {
+        const prevDir = join(dataDir, "previous");
+        mkdirSync(prevDir, { recursive: true });
+        const keep = join(prevDir, out.split(/[\\/]/).pop());
+        try {
+            renameSync(out, keep);
+        }
+        catch {
+            copyFileSync(out, keep); // another drive
+        }
+        previous = relative(root, keep);
+    }
+    let propsFile = null;
+    if (item.props && Object.keys(item.props).length) {
+        propsFile = join(dataDir, `props-${safeName(item.composition)}.json`);
+        writeFileSync(propsFile, JSON.stringify(item.props));
+    }
     const mem = readMemory();
     const concurrency = item.settings.concurrency === "auto" ? autoConcurrency(mem) : item.settings.concurrency;
     const total = item.durationInFrames === null ? null : item.settings.range ? item.settings.range[1] - item.settings.range[0] + 1 : item.durationInFrames;
     const job = {
         id: item.id, kind: item.kind, composition: item.composition, settings: item.settings, concurrency, out: relative(root, out),
         status: "bundling", rendered: 0, encoded: 0, total, checked: 0, eta: null, startedAt: Date.now(), finishedAt: null,
-        memory: mem, minAvailableMB: mem?.availableMB ?? null, maxSwapGB: mem?.swapUsedGB ?? null, sizeMB: null, video: null, audio: null, error: null, log: [],
+        memory: mem, minAvailableMB: mem?.availableMB ?? null, maxSwapGB: mem?.swapUsedGB ?? null, sizeMB: null, video: null, audio: null, error: null, log: [], previous, diff: null,
     };
     let cancelled = false;
     const update = () => opts.onUpdate({ ...job, log: job.log.slice(-8) });
@@ -77,7 +98,7 @@ export const startJob = (opts) => {
             job.maxSwapGB = Math.max(job.maxSwapGB ?? 0, m.swapUsedGB);
         update();
     }, 2000);
-    const proc = npx(renderArgs(entry, item, out, concurrency), { cwd: root, env: { ...process.env, FORCE_COLOR: "0", NO_COLOR: "1" } });
+    const proc = npx(renderArgs(entry, item, out, concurrency, propsFile), { cwd: root, env: { ...process.env, FORCE_COLOR: "0", NO_COLOR: "1" } });
     const onText = (text) => {
         for (const raw of text.split(/[\r\n]+/)) {
             const line = raw.trim();

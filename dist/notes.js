@@ -30,10 +30,16 @@ const normalize = (n) => ({
     marks: Array.isArray(n.marks) ? n.marks : [],
     image: n.image ?? null,
     clean: n.clean ?? null,
+    strip: n.strip ?? null,
     status: n.status === "fixed" ? "fixed" : "open",
     replies: Array.isArray(n.replies) ? n.replies : [],
     created: String(n.created ?? new Date().toISOString()),
     fixed: n.fixed ?? null,
+    author: typeof n.author === "string" && n.author ? n.author : null,
+    props: n.props && typeof n.props === "object" ? n.props : null,
+    createdSnap: n.createdSnap ?? null,
+    baseline: n.baseline ?? null,
+    fix: n.fix ?? null,
 });
 export const loadNotes = (root) => {
     const p = notesFile(root);
@@ -118,11 +124,17 @@ export const describeMark = (m) => {
 export const describeMarks = (marks) => (marks.length ? marks.map(describeMark).join("; ") + " (composition pixels)" : "no mark");
 export const noteSummary = (n) => {
     const lines = [
-        `#${n.id} · ${n.composition} · ${frameLabel(n.frame, n.endFrame, n.fps)} · ${n.kind === "audio" ? "sound" : "picture"} · ${n.status}`,
+        `#${n.id} · ${n.composition} · ${frameLabel(n.frame, n.endFrame, n.fps)} · ${n.kind === "audio" ? "sound" : "picture"} · ${n.status}${n.author ? ` · from reviewer ${n.author}` : ""}`,
         `   "${n.text}"`,
         `   ${n.kind === "audio" ? "about the sound in this stretch" : describeMarks(n.marks)}${n.width ? ` · composition ${n.width}×${n.height}` : ""}`,
     ];
+    if (n.props && Object.keys(n.props).length)
+        lines.push(`   seen with props changed in ReelNote: ${JSON.stringify(n.props).slice(0, 300)}`);
+    if (n.strip)
+        lines.push(`   has a filmstrip of the range (reelnote_note shows it)`);
     for (const rep of n.replies)
-        lines.push(`   ${rep.by === "claude" ? "Claude" : "User"}: ${rep.text}`);
+        lines.push(`   ${rep.by === "claude" ? "Claude" : n.author && rep.by === "you" ? n.author : "User"}: ${rep.text}`);
+    if (n.fix)
+        lines.push(`   Claude changed: ${n.fix.files.map((f) => `${f.path} (+${f.added} −${f.removed})`).join(", ") || "no files"}${n.fix.undone ? " · the user UNDID this change" : ""}`);
     return lines.join("\n");
 };

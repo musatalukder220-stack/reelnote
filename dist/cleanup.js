@@ -1,5 +1,6 @@
 // Leftovers worth deleting: Remotion's temporary bundles and render folders (left behind when a render is stopped
-// or crashes), the frame pictures made for Claude's checks and the audio files behind waveforms.
+// or crashes), the frame pictures made for Claude's checks, the audio files behind waveforms and the renders kept
+// for comparison.
 // Never touches your renders, your notes or your project.
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, rmSync, statSync } from "node:fs";
@@ -39,6 +40,10 @@ export const findLeftovers = (dataDir, tmp = os.tmpdir()) => {
         for (const f of readdirSync(audio))
             if (f.endsWith(".wav"))
                 items.push({ kind: "audio", path: join(audio, f), bytes: sizeOf(join(audio, f)) });
+    const previous = join(dataDir, "previous");
+    if (existsSync(previous))
+        for (const f of readdirSync(previous))
+            items.push({ kind: "previous", path: join(previous, f), bytes: sizeOf(join(previous, f)) });
     return items.filter((i) => i.bytes > 0);
 };
 // Remotion's temp folders belong to a running render or Studio: never delete them while one runs anywhere.

@@ -30,6 +30,18 @@ const en = {
   k_io: "Range start / end", k_x: "Clear range", k_tools: "Circle / box / arrow / pen", k_prev: "Previous / next note", k_help: "This help", k_esc: "Cancel",
   buildError: "Your code has an error. Fix it and save; ReelNote reloads by itself.", windowOnly: "Frame pictures need ReelNote's own window.",
   memory: "Memory", critical: "critical", warning: "low",
+  guides: "Guides", g_none: "No guides", g_thirds: "Thirds grid", g_safe: "Title / action safe", g_tiktok: "TikTok (approx.)", g_reels: "Reels (approx.)", g_shorts: "Shorts (approx.)",
+  guidesNote: "App layouts change; treat these as a guide.", k_guides: "Guides",
+  voice: "Speak", voiceStop: "Stop", voiceLang: "Voice language", voiceNoNet: "Voice typing needs the internet (it's Chrome's own).", voiceDenied: "Allow the microphone for ReelNote to type by voice.", voiceListening: "Listening…",
+  tabProps: "Props", noProps: "This composition has no props.", propsHint: "Change props to try things without touching code. Notes, frame pictures and renders use these values.", resetProps: "Reset all", changed: "changed", badJson: "Not valid JSON",
+  strip: "Frames across the range",
+  changes: "Changes", undoFix: "Undo this change", undoSure: "Undo? Files go back", undone: "Undone", noChange: "No file changed", filesChanged: (n: number) => `${n} file${n === 1 ? "" : "s"}`,
+  compareRenders: "Compare with previous", noFramesChanged: "No frames changed from the previous render", framesChanged: "Changed frames", countChanged: "Frame count",
+  share: "Share for review", shareOn: "Sharing on your Wi‑Fi", shareOff: "Not shared", shareStart: "Start sharing", shareStop: "Stop sharing",
+  shareHint: "People on the same Wi‑Fi open this link on a phone or computer. They can watch and write notes, nothing else. Nothing goes on the internet.",
+  shareWin: "Windows may ask whether Node.js can use private networks: allow it.", noNetwork: "No network found. Connect to Wi‑Fi first.", copy: "Copy",
+  yourName: "Your name", namePh: "Name, so notes show who wrote them", reviewerMode: "Reviewing", by: "by",
+  thumbs: "Thumbnails", loudness: "Loudness",
 };
 
 type Dict = typeof en;
@@ -63,6 +75,18 @@ const bn: Dict = {
   k_io: "রেঞ্জ শুরু / শেষ", k_x: "রেঞ্জ মুছুন", k_tools: "বৃত্ত / বক্স / তীর / কলম", k_prev: "আগের / পরের নোট", k_help: "এই সাহায্য", k_esc: "বাতিল",
   buildError: "আপনার কোডে ভুল আছে। ঠিক করে সেভ করুন; ReelNote নিজেই রিলোড হবে।", windowOnly: "ফ্রেমের ছবি তুলতে ReelNote-এর নিজের উইন্ডো লাগে।",
   memory: "মেমোরি", critical: "খুব কম", warning: "কম",
+  guides: "গাইড", g_none: "গাইড নেই", g_thirds: "তিন ভাগের গ্রিড", g_safe: "টাইটেল / অ্যাকশন সেফ", g_tiktok: "TikTok (আনুমানিক)", g_reels: "Reels (আনুমানিক)", g_shorts: "Shorts (আনুমানিক)",
+  guidesNote: "অ্যাপগুলোর লেআউট বদলায়; এগুলো আনুমানিক।", k_guides: "গাইড",
+  voice: "বলুন", voiceStop: "থামান", voiceLang: "কথার ভাষা", voiceNoNet: "মুখে বলে লিখতে ইন্টারনেট লাগে (এটা Chrome-এর নিজের সুবিধা)।", voiceDenied: "মুখে বলে লিখতে ReelNote-কে মাইক্রোফোন ব্যবহারের অনুমতি দিন।", voiceListening: "শুনছি…",
+  tabProps: "প্রপস", noProps: "এই কম্পোজিশনের কোনো প্রপস নেই।", propsHint: "কোড না ছুঁয়ে প্রপস বদলে দেখুন। নোট, ফ্রেমের ছবি আর রেন্ডার এই মানগুলো ব্যবহার করবে।", resetProps: "সব আগের মতো", changed: "বদলানো", badJson: "JSON ঠিক নেই",
+  strip: "রেঞ্জের ফ্রেমগুলো",
+  changes: "পরিবর্তন", undoFix: "এই পরিবর্তন ফিরিয়ে নিন", undoSure: "নিশ্চিত? ফাইল আগের মতো হবে", undone: "ফিরিয়ে নেওয়া হয়েছে", noChange: "কোনো ফাইল বদলায়নি", filesChanged: (n: number) => `${n}টি ফাইল`,
+  compareRenders: "আগের রেন্ডারের সাথে মেলান", noFramesChanged: "আগের রেন্ডার থেকে কোনো ফ্রেম বদলায়নি", framesChanged: "বদলানো ফ্রেম", countChanged: "ফ্রেম সংখ্যা",
+  share: "রিভিউর জন্য শেয়ার", shareOn: "আপনার Wi‑Fi-তে শেয়ার চালু", shareOff: "শেয়ার বন্ধ", shareStart: "শেয়ার চালু করুন", shareStop: "শেয়ার বন্ধ করুন",
+  shareHint: "একই Wi‑Fi-তে থাকা কেউ ফোন বা কম্পিউটারে এই লিংক খুলবেন। তিনি শুধু দেখতে আর নোট লিখতে পারবেন। কিছুই ইন্টারনেটে যায় না।",
+  shareWin: "Windows জিজ্ঞেস করতে পারে Node.js প্রাইভেট নেটওয়ার্ক ব্যবহার করবে কি না: অনুমতি দিন।", noNetwork: "কোনো নেটওয়ার্ক নেই। আগে Wi‑Fi-তে যুক্ত হোন।", copy: "কপি",
+  yourName: "আপনার নাম", namePh: "নাম দিন, যাতে নোটে দেখা যায় কে লিখেছে", reviewerMode: "রিভিউ করছেন", by: "লিখেছেন",
+  thumbs: "ছোট ছবি", loudness: "শব্দের জোর",
 };
 
 export const dicts = { en, bn };

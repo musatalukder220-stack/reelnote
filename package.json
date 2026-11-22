@@ -1,6 +1,6 @@
 {
   "name": "reelnote",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Review your Remotion video straight from code, frame by frame. Mark what's wrong; Claude Code reads the note, fixes the code and checks the frame. Render once at the end, with every frame checked.",
   "type": "module",
   "bin": {

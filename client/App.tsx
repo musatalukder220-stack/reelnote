@@ -1,14 +1,17 @@
 // The ReelNote window: picture, timeline, marking tools, notes, render and tools.
 import { Player, type PlayerRef } from "@remotion/player";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, boot, fileUrl, on } from "./api";
+import { api, boot, fileUrl, isReviewer, on, savedName } from "./api";
+import { GuideLayer, GUIDES, type Guide } from "./Guides";
+import { PropsPanel } from "./PropsPanel";
+import { VoiceButton } from "./Voice";
 import { dicts, LangContext, type Lang } from "./i18n";
 import { ArrowDefs, FIXED_COLOR, MarkShape, markFromDrag, MARK_COLOR, roundMark } from "./marks";
 import { NotesPanel, noteRange } from "./NotesPanel";
 import { MemBar, RenderPanel } from "./RenderPanel";
 import { Timeline } from "./Timeline";
 import { KeyList, ToolsPanel } from "./ToolsPanel";
-import type { Activity, Comp, Issue, Job, Mark, Memory, Note, RenderState, Settings, Tool, Waveform } from "./types";
+import type { Activity, Comp, Issue, Job, Mark, Memory, Note, PropsMap, RenderState, Settings, ShareInfo, Tool, Waveform } from "./types";
 
 type Draft = { kind: "visual" | "audio"; tool: Tool; marks: Mark[]; text: string; saving: boolean };
 type Drag = { a: [number, number]; b: [number, number]; pen: [number, number][] };
@@ -24,9 +27,13 @@ const readHash = () => {
   return m ? { comp: m[1], frame: Number(m[2]) } : null;
 };
 
-export const App: React.FC<{ comps: Comp[] }> = ({ comps }) => {
+export const App: React.FC<{ comps: Comp[] }> = ({ comps: baseComps }) => {
   const start = readHash();
-  const [compId, setCompId] = useState(() => (start && comps.some((c) => c.id === start.comp) ? start.comp : comps[0]?.id ?? ""));
+  const [compId, setCompId] = useState(() => (start && baseComps.some((c) => c.id === start.comp) ? start.comp : baseComps[0]?.id ?? ""));
+  // props changed in the props editor, and what calculateMetadata says with them
+  const [propsMap, setPropsMap] = useState<PropsMap>({});
+  const [meta, setMeta] = useState<Record<string, Partial<Comp>>>({});
+  const comps = useMemo(() => baseComps.map((c) => ({ ...c, ...(meta[c.id] ?? {}), props: { ...c.defaults, ...(propsMap[c.id] ?? {}) } })), [baseComps, propsMap, meta]);
   const comp = comps.find((c) => c.id === compId) ?? null;
   const [frame, setFrame] = useState(() => (start && start.comp === compId ? start.frame : 0));
   const [playing, setPlaying] = useState(false);
@@ -35,9 +42,13 @@ export const App: React.FC<{ comps: Comp[] }> = ({ comps }) => {
   const [rq, setRq] = useState<RenderState>({ job: null, queue: [], waiting: null, history: [] });
   const [job, setJob] = useState<Job | null>(null);
   const [mem, setMem] = useState<Memory>(null);
-  const [settings, setSettings] = useState<Settings>({ lang: boot.lang, render: { codec: "h264", scale: 1, crf: null, concurrency: "auto", range: null, muted: false } });
+  const [settings, setSettings] = useState<Settings>({ lang: boot.lang, render: { codec: "h264", scale: 1, crf: null, concurrency: "auto", range: null, muted: false }, thumbs: true });
+  const [share, setShare] = useState<ShareInfo>({ on: false, urls: [], port: null });
+  const [guide, setGuide] = useState<Guide>("none");
+  const [name, setName] = useState(savedName);
+  const [interim, setInterim] = useState("");
   const [acts, setActs] = useState<Activity[]>([]);
-  const [tab, setTab] = useState<"notes" | "render" | "tools">("notes");
+  const [tab, setTab] = useState<"notes" | "render" | "props" | "tools">("notes");
   const [draft, setDraft] = useState<Draft | null>(null);
   const [drag, setDrag] = useState<Drag | null>(null);
   const [lastTool, setLastTool] = useState<Tool>("ellipse");
@@ -67,15 +78,18 @@ export const App: React.FC<{ comps: Comp[] }> = ({ comps }) => {
 
   // ---------- data from the server ----------
   useEffect(() => {
-    api<{ notes: Note[]; render: RenderState; memory: Memory; settings: Settings }>("state").then((s) => {
+    api<{ notes: Note[]; render: RenderState; memory: Memory; settings: Settings; props: PropsMap; share: ShareInfo | null }>("state").then((s) => {
       setNotes(s.notes);
       setRq(s.render);
       setJob(s.render.job);
       setMem(s.memory);
       setSettings(s.settings);
+      setPropsMap(s.props ?? {});
+      if (s.share) setShare(s.share);
     }).catch((e: Error) => toast(e.message));
-    api("compositions", { body: { compositions: comps.map(({ component: _c, lazyComponent: _l, props: _p, ...rest }) => rest) } }).catch(() => {});
     const offs = [
+      on<PropsMap>("props", setPropsMap),
+      on<ShareInfo>("share", setShare),
       on<Note[]>("notes", setNotes),
       on<RenderState>("render", (r) => { setRq(r); setJob(r.job); }),
       on<Job>("job", setJob),
@@ -83,12 +97,53 @@ export const App: React.FC<{ comps: Comp[] }> = ({ comps }) => {
       on<{ composition: string }>("waveform", ({ composition }) => loadWave(composition)),
     ];
     (window as unknown as { __rnShowError: (s: string) => void }).__rnShowError = setBuildError;
-    const memTimer = setInterval(() => api<Memory>("memory").then(setMem).catch(() => {}), 5000);
+    const memTimer = isReviewer ? undefined : setInterval(() => api<Memory>("memory").then(setMem).catch(() => {}), 5000);
     return () => {
       offs.forEach((f) => f());
       clearInterval(memTimer);
     };
   }, []);
+
+  useEffect(() => {
+    if (isReviewer) return;
+    const id = setTimeout(() => {
+      api("compositions", { body: { compositions: comps.map(({ component: _c, lazyComponent: _l, props: _p, defaults: _d, calc: _k, ...rest }) => rest) } }).catch(() => {});
+    }, 200);
+    return () => clearTimeout(id);
+  }, [comps]);
+  useEffect(() => {
+    let live = true;
+    (async () => {
+      const next: Record<string, Partial<Comp>> = {};
+      for (const c of baseComps) {
+        const over = propsMap[c.id];
+        if (!c.calc || !over || !Object.keys(over).length) continue;
+        try {
+          const props = { ...c.defaults, ...over };
+          const r = (await c.calc({ defaultProps: c.defaults, props, abortSignal: new AbortController().signal, compositionId: c.id, isRendering: false })) ?? {};
+          const num = (k: string) => (Number.isFinite(Number(r[k])) && Number(r[k]) > 0 ? Number(r[k]) : undefined);
+          next[c.id] = Object.fromEntries(Object.entries({ durationInFrames: num("durationInFrames"), fps: num("fps"), width: num("width"), height: num("height") }).filter(([, v]) => v !== undefined));
+        } catch {
+          /* keep the defaults' metadata */
+        }
+      }
+      if (live) setMeta(next);
+    })();
+    return () => {
+      live = false;
+    };
+  }, [propsMap, baseComps]);
+  const savePropsFor = (id: string, next: Record<string, unknown>) => {
+    setPropsMap((m) => {
+      const copy = { ...m };
+      if (Object.keys(next).length) copy[id] = next;
+      else delete copy[id];
+      return copy;
+    });
+    clearTimeout(propsTimer.current);
+    propsTimer.current = setTimeout(() => api("props", { method: "PUT", body: { composition: id, props: next } }).catch((e: Error) => toast(e.message)), 300);
+  };
+  const propsTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
 
   const loadWave = (id: string) =>
     api<Waveform>(`waveform?composition=${encodeURIComponent(id)}`).then((w) => setWaves((x) => ({ ...x, [id]: w }))).catch(() => setWaves((x) => ({ ...x, [id]: null })));
@@ -191,12 +246,12 @@ export const App: React.FC<{ comps: Comp[] }> = ({ comps }) => {
     try {
       const n = await api<Note>("notes", { body: {
         composition: comp.id, frame: at, endFrame: range && range[1] > range[0] ? range[1] : null, fps: comp.fps, width: comp.width, height: comp.height,
-        kind: draft.kind, text: draft.text, marks: draft.kind === "visual" ? draft.marks : [],
+        kind: draft.kind, text: draft.text, marks: draft.kind === "visual" ? draft.marks : [], author: name,
       } });
       setDraft(null);
       setRange(null);
       setSelected(n.id);
-      toast(`${t.saved} · #${n.id}`);
+      toast(`${t.saved} · #${n.id}${(n as Note & { warnings?: string[] }).warnings?.length ? ` · ${(n as Note & { warnings?: string[] }).warnings![0]}` : ""}`);
     } catch (e) {
       setDraft((d) => (d ? { ...d, saving: false } : d));
       toast((e as Error).message);
@@ -262,6 +317,7 @@ export const App: React.FC<{ comps: Comp[] }> = ({ comps }) => {
       else if (k === "[") stepNote(-1);
       else if (k === "]") stepNote(1);
       else if (k === "?") setHelp((h) => !h);
+      else if (k === "g" || k === "G") setGuide((g) => GUIDES[(GUIDES.indexOf(g) + 1) % GUIDES.length]);
       else if (draft && /^[1-4]$/.test(k)) {
         const tool = TOOLS[Number(k) - 1];
         setLastTool(tool);
@@ -315,6 +371,22 @@ export const App: React.FC<{ comps: Comp[] }> = ({ comps }) => {
       const end = Date.now() + ms;
       while (!ok() && Date.now() < end) await sleep(30);
     };
+    // let images, videos and fonts settle, then report where the picture is
+    const settle = async (compWidth: number) => {
+      await frames2();
+      await waitFor(() => {
+        const root = frameRef.current;
+        if (!root || buffering.current) return false;
+        const imgs = Array.from(root.querySelectorAll("img")).every((i) => i.complete);
+        const vids = Array.from(root.querySelectorAll("video")).every((v) => v.readyState >= 2 && !v.seeking);
+        return imgs && vids;
+      }, 6000);
+      await document.fonts.ready;
+      await frames2();
+      await sleep(60);
+      const r = frameRef.current!.getBoundingClientRect();
+      return { x: r.left, y: r.top, width: r.width, height: r.height, compWidth };
+    };
     (window as unknown as { __reelnote: unknown }).__reelnote = {
       prepareCapture: async (o: { composition: string; frame: number; marks: Mark[] | null }) => {
         const c = ctl.current;
@@ -330,20 +402,42 @@ export const App: React.FC<{ comps: Comp[] }> = ({ comps }) => {
           await frames2();
         }
         ctl.current.seek(o.frame);
-        await frames2();
-        // let images, videos and fonts settle
-        await waitFor(() => {
-          const root = frameRef.current;
-          if (!root || buffering.current) return false;
-          const imgs = Array.from(root.querySelectorAll("img")).every((i) => i.complete);
-          const vids = Array.from(root.querySelectorAll("video")).every((v) => v.readyState >= 2 && !v.seeking);
-          return imgs && vids;
-        }, 6000);
-        await document.fonts.ready;
-        await frames2();
-        await sleep(60);
-        const r = frameRef.current!.getBoundingClientRect();
-        return { x: r.left, y: r.top, width: r.width, height: r.height, compWidth: target.width };
+        return settle(target.width);
+      },
+      moveTo: async (frame: number) => {
+        ctl.current.seek(frame);
+        const c = ctl.current.comps.find((x) => x.id === ctl.current.compId)!;
+        return settle(c.width);
+      },
+      // lay frame pictures out in a grid, each labelled with its frame number
+      composeStrip: async (o: { images: string[]; labels: string[] }) => {
+        const imgs = await Promise.all(o.images.map((b64) => new Promise<HTMLImageElement>((res, rej) => {
+          const i = new Image();
+          i.onload = () => res(i);
+          i.onerror = rej;
+          i.src = `data:image/png;base64,${b64}`;
+        })));
+        const n = imgs.length, cols = n <= 4 ? n : n <= 6 ? 3 : 4, rows = Math.ceil(n / cols);
+        const w = imgs[0].width, h = imgs[0].height, gap = 6;
+        const cv = document.createElement("canvas");
+        cv.width = cols * w + (cols - 1) * gap;
+        cv.height = rows * h + (rows - 1) * gap;
+        const g = cv.getContext("2d")!;
+        g.fillStyle = "#0d0f1e";
+        g.fillRect(0, 0, cv.width, cv.height);
+        const fs = Math.max(12, Math.round(w / 16));
+        imgs.forEach((im, i) => {
+          const x = (i % cols) * (w + gap), y = Math.floor(i / cols) * (h + gap);
+          g.drawImage(im, x, y, w, h);
+          const label = o.labels[i];
+          g.font = `700 ${fs}px system-ui, sans-serif`;
+          const tw = g.measureText(label).width;
+          g.fillStyle = "rgba(0,0,0,.7)";
+          g.fillRect(x + 6, y + 6, tw + fs * 0.8, fs * 1.5);
+          g.fillStyle = "#ffd23f";
+          g.fillText(label, x + 6 + fs * 0.4, y + 6 + fs * 1.1);
+        });
+        return cv.toDataURL("image/png");
       },
       finishCapture: async () => {
         setCapture(null);
@@ -394,10 +488,10 @@ export const App: React.FC<{ comps: Comp[] }> = ({ comps }) => {
             })}
           </select>
           <div className="spacer" />
-          <MemBar m={mem} />
+          {isReviewer ? <span className="chip who">● {t.reviewerMode}</span> : <MemBar m={mem} />}
           <div className="seg small">
             {(["en", "bn"] as Lang[]).map((l) => (
-              <button key={l} className={settings.lang === l ? "on" : ""} onClick={() => saveSettings({ ...settings, lang: l })}>{l === "en" ? "EN" : "বাং"}</button>
+              <button key={l} className={settings.lang === l ? "on" : ""} onClick={() => (isReviewer ? setSettings({ ...settings, lang: l }) : saveSettings({ ...settings, lang: l }))}>{l === "en" ? "EN" : "বাং"}</button>
             ))}
           </div>
           <button className="icon" onClick={() => setHelp(true)} title={t.k_help}>?</button>
@@ -428,6 +522,7 @@ export const App: React.FC<{ comps: Comp[] }> = ({ comps }) => {
                   <Player
                     key={comp.id}
                     ref={setPlayer}
+                    className="rn-film"
                     {...(comp.lazyComponent ? { lazyComponent: comp.lazyComponent } : { component: comp.component! })}
                     inputProps={comp.props}
                     durationInFrames={comp.durationInFrames}
@@ -468,6 +563,7 @@ export const App: React.FC<{ comps: Comp[] }> = ({ comps }) => {
                         {!draft && !compare && marksHere.map((n) => n.marks.map((m, i) => (
                           <MarkShape key={`${n.id}-${i}`} mark={m} stroke={stroke} color={n.status === "fixed" ? FIXED_COLOR : MARK_COLOR} label={i === 0 ? String(n.id) : undefined} />
                         )))}
+                        <GuideLayer guide={guide} width={comp.width} height={comp.height} />
                         {draft?.marks.map((m, i) => <MarkShape key={i} mark={m} stroke={stroke} />)}
                         {dragMark && <MarkShape mark={dragMark} stroke={stroke} />}
                       </>
@@ -486,15 +582,20 @@ export const App: React.FC<{ comps: Comp[] }> = ({ comps }) => {
 
             {draft && (
               <div className="composer">
-                <textarea ref={textRef} value={draft.text} placeholder={draft.kind === "audio" ? t.soundHint : t.writeHint} disabled={draft.saving}
-                  onChange={(e) => setDraft({ ...draft, text: e.target.value })}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && !e.shiftKey) {
-                      e.preventDefault();
-                      saveNote();
-                    }
-                  }} />
+                <div className="composer-main">
+                  <textarea ref={textRef} value={draft.text} placeholder={draft.kind === "audio" ? t.soundHint : t.writeHint} disabled={draft.saving}
+                    onChange={(e) => setDraft({ ...draft, text: e.target.value })}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.shiftKey) {
+                        e.preventDefault();
+                        saveNote();
+                      }
+                    }} />
+                  {interim && <p className="interim">{interim}</p>}
+                </div>
                 <div className="composer-side">
+                  <VoiceButton uiLang={settings.lang} toast={toast} onInterim={setInterim} stopSignal={draft.saving}
+                    onText={(s) => setDraft((d) => (d ? { ...d, text: `${d.text}${d.text && !/\s$/.test(d.text) ? " " : ""}${s}` } : d))} />
                   <span className="muted small">{range && range[1] > range[0] ? `${t.range} ${range[0]}–${range[1]}` : `${t.frame} ${range ? range[0] : frame}`} · {draft.marks.length} ✎</span>
                   <span className="muted small">{t.enterToSave}</span>
                   <div className="row">
@@ -520,6 +621,9 @@ export const App: React.FC<{ comps: Comp[] }> = ({ comps }) => {
                 <button className="icon" onClick={() => { player?.pause(); seek(frame + 1); }} title={t.fwd}>⏭</button>
                 <span className="counter"><b>{frame}</b> / {last} <span className="muted">· {tc(frame)}</span></span>
                 <div className="spacer" />
+                <select className="guide-select" value={guide} onChange={(e) => setGuide(e.target.value as Guide)} title={`${t.guides} (G) · ${t.guidesNote}`}>
+                  {GUIDES.map((g) => <option key={g} value={g}>{g === "none" ? `▦ ${t.guides}` : t[`g_${g}`]}</option>)}
+                </select>
                 <button onClick={() => setRange((r) => [frame, r && r[1] >= frame ? r[1] : frame])} title={t.setIn}>[ I</button>
                 <button onClick={() => setRange((r) => [r && r[0] <= frame ? r[0] : frame, frame])} title={t.setOut}>O ]</button>
                 {range && <span className="chip">{t.range} {range[0]}–{range[1]} <button className="x" onClick={() => setRange(null)} title={t.clearRange}>×</button></span>}
@@ -529,17 +633,23 @@ export const App: React.FC<{ comps: Comp[] }> = ({ comps }) => {
             )}
             {comp && (
               <Timeline duration={comp.durationInFrames} fps={comp.fps} frame={frame} notes={compNotes} selected={selected} range={range}
-                peaks={wave?.peaks ?? null} issues={timelineIssues} waveBusy={waveBusy}
+                peaks={wave?.peaks ?? null} issues={timelineIssues} waveBusy={waveBusy} comp={comp} thumbs={settings.thumbs} canWave={!isReviewer}
                 onSeek={(f) => seek(f)} onScrub={(s) => s && player?.pause()} onRange={setRange}
                 onPick={(id) => { const n = notes.find((x) => x.id === id); if (n) goNote(n); }}
                 onWave={() => api("waveform", { body: { composition: compId } }).catch((e: Error) => toast(e.message))} />
             )}
-            {comp && wave && (
+            {comp && (
               <div className="wave-meta muted small">
-                ♪ {wave.hasAudio ? `${wave.rmsDb} dB avg · ${wave.peakDb} dB peak` : "—"}
-                <button className="link" disabled={waveBusy} onClick={() => api("waveform", { body: { composition: compId } }).catch((e: Error) => toast(e.message))}>
-                  {waveBusy ? t.waveformBuilding : t.waveformRefresh}
-                </button>
+                {wave && <>♪ {wave.hasAudio ? `${t.loudness} ${wave.lufs ?? "–"} LUFS · peak ${wave.peakDb} dBFS` : "—"}</>}
+                {wave && !isReviewer && (
+                  <button className="link" disabled={waveBusy} onClick={() => api("waveform", { body: { composition: compId } }).catch((e: Error) => toast(e.message))}>
+                    {waveBusy ? t.waveformBuilding : t.waveformRefresh}
+                  </button>
+                )}
+                <div className="spacer" />
+                {!isReviewer && (
+                  <label className="check"><input type="checkbox" checked={settings.thumbs} onChange={(e) => saveSettings({ ...settings, thumbs: e.target.checked })} /> {t.thumbs}</label>
+                )}
               </div>
             )}
           </section>
@@ -547,16 +657,22 @@ export const App: React.FC<{ comps: Comp[] }> = ({ comps }) => {
           <aside className="side">
             <nav className="tabs">
               <button className={tab === "notes" ? "on" : ""} onClick={() => setTab("notes")}>{t.tabNotes} {openCount > 0 && <span className="count">{openCount}</span>}</button>
-              <button className={tab === "render" ? "on" : ""} onClick={() => setTab("render")}>{t.tabRender} {busy && <span className="dot" />}</button>
-              <button className={tab === "tools" ? "on" : ""} onClick={() => setTab("tools")}>{t.tabTools}</button>
+              {!isReviewer && (
+                <>
+                  <button className={tab === "render" ? "on" : ""} onClick={() => setTab("render")}>{t.tabRender} {busy && <span className="dot" />}</button>
+                  <button className={tab === "props" ? "on" : ""} onClick={() => setTab("props")}>{t.tabProps} {comp && propsMap[comp.id] && <span className="dot warn" />}</button>
+                  <button className={tab === "tools" ? "on" : ""} onClick={() => setTab("tools")}>{t.tabTools} {share.on && <span className="dot" />}</button>
+                </>
+              )}
             </nav>
             <div className="side-body">
-              {tab === "notes" && <NotesPanel notes={notes} compId={compId} selected={selected} onGo={goNote} onCompare={openCompare} toast={toast} />}
+              {tab === "notes" && <NotesPanel notes={notes} comps={comps} compId={compId} selected={selected} onGo={goNote} onCompare={openCompare} toast={toast} name={name} onName={setName} />}
+              {tab === "props" && <PropsPanel comp={comp ? baseComps.find((c) => c.id === comp.id) ?? null : null} override={propsMap[compId] ?? {}} onChange={(next) => savePropsFor(compId, next)} />}
               {tab === "render" && (
                 <RenderPanel comp={comp} rq={rq} job={job} mem={mem} settings={settings.render} range={range}
                   onSettings={(r) => saveSettings({ ...settings, render: r })} onJump={(c, f) => { player?.pause(); switchComp(c, f); }} toast={toast} />
               )}
-              {tab === "tools" && <ToolsPanel lang={settings.lang} toast={toast} busy={busy} />}
+              {tab === "tools" && <ToolsPanel lang={settings.lang} toast={toast} busy={busy} share={share} />}
             </div>
             <div className="activity">
               <h5>✦ {t.claudeActivity}</h5>

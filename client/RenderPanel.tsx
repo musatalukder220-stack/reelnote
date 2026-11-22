@@ -128,7 +128,25 @@ export const RenderPanel: React.FC<Props> = ({ comp, rq, job, mem, settings: s, 
               {r.status === "done" && <button onClick={() => act(api("reveal", { body: { path: r.out } }))}>{t.show}</button>}
             </div>
             {r.status === "failed" && r.error && <pre className="log err">{r.error}</pre>}
-            {r.audio?.hasAudio && r.kind === "video" && <div className="muted small">♪ {r.audio.rmsDb} dB avg · {r.audio.peakDb} dB peak</div>}
+            {r.audio?.hasAudio && r.kind === "video" && <div className="muted small">♪ {r.audio.lufs ?? "–"} LUFS · peak {r.audio.peakDb} dBFS</div>}
+            {r.status === "done" && r.kind === "video" && r.previous && !r.diff && (
+              <button className="small-btn" onClick={() => act(api("render/diff", { body: { id: r.id } }))}>⇄ {t.compareRenders}</button>
+            )}
+            {r.diff && (
+              <div className="rdiff">
+                {r.diff.frames[0] !== r.diff.frames[1] && <span className="issue warning">{t.countChanged}: {r.diff.frames[0]} → {r.diff.frames[1]}</span>}
+                {!r.diff.changed.length ? <span className="muted small">✓ {t.noFramesChanged}</span> : (
+                  <div className="issues">
+                    <span className="small muted">⇄ {t.framesChanged}:</span>
+                    {r.diff.changed.map((c, k) => (
+                      <button key={k} className="issue info" onClick={() => onJump(r.composition, c.from + (r.settings.range?.[0] ?? 0))}>
+                        {c.from === c.to ? c.from : `${c.from}–${c.to}`}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
             {issues.length > 0 && <IssueChips issues={issues} onJump={(f) => onJump(r.composition, f + (r.settings.range?.[0] ?? 0))} />}
           </div>
         );

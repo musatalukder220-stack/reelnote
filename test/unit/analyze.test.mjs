@@ -53,7 +53,7 @@ const tone = (seconds, amp = 0.3, rate = 8000) => Int16Array.from({ length: seco
 const silence = (seconds, rate = 8000) => new Int16Array(seconds * rate);
 
 test("audio: loudness per frame, silent gap in the middle", () => {
-  const a = new AudioAnalyzer(25);
+  const a = new AudioAnalyzer(25, 8000, 1);
   a.pushSamples(silence(1));
   a.pushSamples(tone(1));
   a.pushSamples(silence(1));
@@ -69,13 +69,34 @@ test("audio: loudness per frame, silent gap in the middle", () => {
 });
 
 test("audio: clipping is found", () => {
-  const a = new AudioAnalyzer(30);
+  const a = new AudioAnalyzer(30, 8000, 1);
   a.pushSamples(tone(1, 1.2).map((v) => Math.max(-32768, Math.min(32767, v))));
   assert.ok(a.finish().issues.some((i) => i.kind === "clipping"));
 });
 
 test("audio: frame count stays exact with fractional samples per frame", () => {
-  const a = new AudioAnalyzer(29.97);
+  const a = new AudioAnalyzer(29.97, 8000, 1);
   a.pushSamples(tone(10));
   assert.ok(Math.abs(a.finish().frames - 299.7) <= 1);
+});
+
+test("loudness: a −20 dBFS 997 Hz tone in both channels reads −20 LUFS", () => {
+  const rate = 48000, n = rate * 5;
+  const s = new Int16Array(n * 2);
+  for (let i = 0; i < n; i++) s[2 * i] = s[2 * i + 1] = Math.round(Math.sin((2 * Math.PI * 997 * i) / rate) * 0.1 * 32767);
+  const a = new AudioAnalyzer(30);
+  a.pushSamples(s);
+  const r = a.finish();
+  assert.ok(Math.abs(r.lufs + 20) < 0.3, `got ${r.lufs}`);
+  assert.ok(r.issues.some((i) => i.kind === "loudness" && i.level === "info"), "quiet-ish but fine");
+  assert.equal(r.frames, 150);
+});
+
+test("loudness advice", async () => {
+  const { loudnessIssues } = await import("../../dist/analyze.js");
+  assert.equal(loudnessIssues(-6, -0.1, false)[0].level, "warning");
+  assert.match(loudnessIssues(-11, -3, false)[0].message, /down about 3 dB/);
+  assert.equal(loudnessIssues(-24, -10, false)[0].level, "warning");
+  assert.ok(loudnessIssues(-14, -0.5, false).some((i) => /under −1 dBFS/.test(i.message)));
+  assert.deepEqual(loudnessIssues(null, null, false), []);
 });

@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -74,4 +74,16 @@ test("init connects Claude Code and keeps existing settings", () => {
   assert.equal(st.model, "opus");
   execFileSync(process.execPath, [CLI, "init"], { cwd: root, stdio: "ignore" });
   assert.deepEqual(JSON.parse(readFileSync(join(root, ".claude", "settings.json"), "utf8")).permissions.allow, ["Bash(ls)", "mcp__reelnote"], "running twice adds nothing");
+});
+
+test("init run through npx keeps a copy in the project", () => {
+  const root = fakeProject();
+  const cache = join(root, "..", `_npx`, `${Date.now()}`, "node_modules", "reelnote");
+  mkdirSync(cache, { recursive: true });
+  const pkg = fileURLToPath(new URL("../../", import.meta.url));
+  for (const part of ["dist", "client", "package.json"]) cpSync(join(pkg, part), join(cache, part), { recursive: true });
+  execFileSync(process.execPath, [join(cache, "dist", "cli.js"), "init"], { cwd: root, stdio: "ignore" });
+  const m = JSON.parse(readFileSync(join(root, ".mcp.json"), "utf8"));
+  assert.equal(m.mcpServers.reelnote.args[0], join(root, ".reelnote", "app", "dist", "cli.js"));
+  assert.ok(existsSync(join(root, ".reelnote", "app", "client", "App.tsx")));
 });

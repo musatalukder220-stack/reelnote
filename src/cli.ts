@@ -24,6 +24,7 @@ Options for the window
   --no-window             don't open a window (frame pictures need it)
   --headless              open the window invisibly (servers, CI, remote machines)
   --window <w,h>          window size (default 1600,1000)
+  --share                 share a review link on your Wi-Fi / local network (also a button in the window)
 
 Keys in the window: Space play · ←/→ frame · Shift+←/→ 10 frames · N mark & note · A sound note · I/O range · ? all keys
 `;
@@ -46,6 +47,7 @@ const main = async () => {
       await startApp({
         project: opt("project"), entry: opt("entry"), port: port ? Number(port) : undefined, portExplicit: !!port,
         window: !flag("no-window"), headless: flag("headless"), size: opt("window") ?? "1600,1000", position: opt("window-position") ?? "40,40",
+        share: flag("share"),
       });
       return;
     }
@@ -72,7 +74,7 @@ const main = async () => {
       if (process.stdout.isTTY) process.stdout.write(`\r${" ".repeat(24)}\r`);
       const a = await analyzeAudio({ root, file, fps, ffmpeg });
       const all = [...v.issues, ...a.issues].sort((x, y) => x.frame - y.frame);
-      console.log(`${v.frames} frames at ${fps} fps · sound ${a.hasAudio ? `avg ${a.rmsDb} dB, peak ${a.peakDb} dB` : "none"}`);
+      console.log(`${v.frames} frames at ${fps} fps · sound ${a.hasAudio ? `${a.lufs ?? "–"} LUFS, peak ${a.peakDb} dBFS` : "none"}`);
       if (!all.length) console.log("No problems found.");
       for (const i of all) console.log(`  ${i.level === "error" ? "✗" : i.level === "warning" ? "!" : "·"} ${i.message}`);
       process.exitCode = all.some((i) => i.level === "error") ? 1 : 0;

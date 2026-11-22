@@ -1,7 +1,9 @@
 import { spawn } from "node:child_process";
 import { createReadStream, existsSync, readFileSync, rmSync, statSync, watch, writeFileSync } from "node:fs";
 import http from "node:http";
+import os from "node:os";
 import { dirname, extname, isAbsolute, join, relative } from "node:path";
+import { diffVideos } from "./analyze.js";
 import { findBrowser, launchWindow } from "./browser.js";
 import { createBundler } from "./bundler.js";
 import { createCapturer } from "./capture.js";
@@ -11,7 +13,8 @@ import { dataDir, loadNotes, nextId, updateNotes } from "./notes.js";
 import { findEntry, findProject, findPublicDir, inside, listPublicFiles, packageVersion, resolveFromProject } from "./project.js";
 import { cleanSettings, DEFAULT_SETTINGS, startJob } from "./render.js";
 import { writeReport } from "./report.js";
-import { freePort, safeName, token as makeToken, VERSION } from "./util.js";
+import { diffSnapshots, pruneSnapshots, takeSnapshot, undoFix } from "./snapshots.js";
+import { CLIENT_DIR, freePort, safeName, token as makeToken, VERSION } from "./util.js";
 const MIME = {
     ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".mjs": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
     ".json": "application/json", ".map": "application/json", ".txt": "text/plain; charset=utf-8", ".md": "text/markdown; charset=utf-8",
@@ -20,6 +23,11 @@ const MIME = {
     ".flac": "audio/flac", ".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime", ".mkv": "video/x-matroska", ".woff": "font/woff",
     ".woff2": "font/woff2", ".ttf": "font/ttf", ".otf": "font/otf", ".pdf": "application/pdf", ".wasm": "application/wasm", ".glb": "model/gltf-binary",
 };
+// what a reviewer on the share link may do: watch, read notes, write notes and replies
+const REVIEWER_API = [
+    ["GET", /^state$/], ["GET", /^compositions$/], ["GET", /^notes$/], ["POST", /^notes$/], ["POST", /^notes\/\d+\/replies$/],
+    ["GET", /^waveform$/], ["GET", /^props$/],
+];
 const fail = (msg) => {
     console.error(`ReelNote: ${msg}`);
     process.exit(1);
@@ -33,6 +41,7 @@ const pidAlive = (pid) => {
         return false;
     }
 };
+export const lanAddresses = () => Object.values(os.networkInterfaces()).flat().filter((a) => !!a && a.family === "IPv4" && !a.internal).map((a) => a.address);
 export const startApp = async (o) => {
     const project = findProject(o.project ?? process.cwd()) ?? fail("no Remotion project here (no package.json that depends on remotion). Run ReelNote inside your Remotion project, or pass --project <folder>.");
     const ROOT = project.root;
@@ -52,6 +61,7 @@ export const startApp = async (o) => {
     const SETTINGS_FILE = join(DIR, "settings.json");
     const RENDERS_FILE = join(DIR, "renders.json");
     const COMPS_FILE = join(DIR, "compositions.json");
+    const PROPS_FILE = join(DIR, "props.json");
     // one ReelNote per project
     if (existsSync(SERVER_FILE)) {
         try {
@@ -75,9 +85,10 @@ export const startApp = async (o) => {
             return def;
         }
     };
-    let settings = readJson(SETTINGS_FILE, { lang: "en", render: DEFAULT_SETTINGS });
-    settings = { lang: settings.lang === "bn" ? "bn" : "en", render: cleanSettings(settings.render) };
+    const raw = readJson(SETTINGS_FILE, {});
+    let settings = { lang: raw.lang === "bn" ? "bn" : "en", render: cleanSettings(raw.render ?? DEFAULT_SETTINGS), thumbs: raw.thumbs !== false };
     let compositions = readJson(COMPS_FILE, []);
+    const props = readJson(PROPS_FILE, {});
     // ---------- live events (server-sent) ----------
     const clients = new Set();
     const broadcast = (event, data) => {
@@ -115,6 +126,7 @@ export const startApp = async (o) => {
     const queue = [];
     let waiting = null;
     let history = readJson(RENDERS_FILE, []);
+    const saveHistory = () => writeFileSync(RENDERS_FILE, JSON.stringify(history, null, 1));
     const slim = (j) => (j ? { ...j, audio: j.audio ? { ...j.audio, peaks: [] } : null } : null);
     const busy = () => !!current && !["done", "failed", "cancelled"].includes(current.status);
     const renderState = () => ({ job: slim(current), queue, waiting, history: history.slice(-12).reverse() });
@@ -143,7 +155,7 @@ export const startApp = async (o) => {
                 const { log: _log, memory: _mem, ...rest } = j;
                 history.push({ ...rest, audio: rest.audio ? { ...rest.audio, peaks: [] } : null, minutes: ((j.finishedAt ?? Date.now()) - j.startedAt) / 60000 });
                 history = history.slice(-50);
-                writeFileSync(RENDERS_FILE, JSON.stringify(history, null, 1));
+                saveHistory();
                 if (j.kind === "waveform" && j.status === "done")
                     broadcast("waveform", { composition: j.composition });
                 setTimeout(pump, 300);
@@ -154,9 +166,10 @@ export const startApp = async (o) => {
     };
     const enqueue = (kind, composition, s) => {
         const c = compositions.find((x) => x.id === composition);
+        const p = props[composition];
         const item = {
             id: `${Date.now().toString(36)}-${++idSeq}`, kind, composition, settings: kind === "waveform" ? { ...cleanSettings(undefined), range: null } : cleanSettings(s),
-            durationInFrames: c?.durationInFrames ?? null, fps: c?.fps ?? null, added: Date.now(),
+            durationInFrames: c?.durationInFrames ?? null, fps: c?.fps ?? null, added: Date.now(), props: p && Object.keys(p).length ? p : null,
         };
         queue.push(item);
         pump();
@@ -170,6 +183,9 @@ export const startApp = async (o) => {
         else
             spawn("xdg-open", [dirname(file)], { stdio: "ignore" });
     };
+    // ---------- sharing with reviewers on the same network ----------
+    let share = null;
+    const shareInfo = () => (share ? { on: true, urls: lanAddresses().map((ip) => `http://${ip}:${share.port}/?k=${share.key}`), port: share.port } : { on: false, urls: [], port: null });
     // ---------- http helpers ----------
     const sendFile = (req, res, file) => {
         const st = statSync(file);
@@ -211,17 +227,17 @@ export const startApp = async (o) => {
             }
         });
     });
-    const index = () => {
+    const index = (role, key) => {
         const boot = {
-            token: TOKEN, version: VERSION, project: project.name, lang: settings.lang,
+            token: key, role, version: VERSION, project: project.name, lang: settings.lang,
             staticFiles: listPublicFiles(PUBLIC, "/__rn/public"), buildError: lastBuildError,
         };
         return `<!doctype html>
 <html><head><meta charset="utf-8"><title>ReelNote · ${project.name.replace(/</g, "")}</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <link rel="icon" href="data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#14162b"/><circle cx="32" cy="32" r="17" fill="none" stroke="#ffc83d" stroke-width="6"/></svg>')}">
-<link rel="stylesheet" href="/__rn/build/main.css"></head>
-<body><div id="root"></div>
+<link rel="stylesheet" href="/__rn/build/main.css"><link rel="stylesheet" href="/__rn/ui.css?v=${VERSION}"></head>
+<body class="role-${role}"><div id="root"></div>
 <script>
   window.__RN = ${JSON.stringify(boot).replace(/</g, "\\u003c")};
   window.remotion_staticBase = "/__rn/public";
@@ -239,76 +255,178 @@ export const startApp = async (o) => {
 <script type="module" src="/__rn/build/main.js"></script>
 </body></html>`;
     };
+    // shared by the main server and the share server
+    const handle = async (req, res, role, key) => {
+        const url = new URL(req.url ?? "/", "http://localhost");
+        const p = url.pathname;
+        if (p === "/" || p === "/index.html") {
+            res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+            return res.end(index(role, key));
+        }
+        if (p === "/__rn/ping")
+            return json(res, 200, { ok: true, version: VERSION });
+        // ReelNote's own look, loaded after the film's CSS
+        if (p === "/__rn/ui.css")
+            return sendFile(req, res, join(CLIENT_DIR, "style.css"));
+        if (p.startsWith("/__rn/build/")) {
+            const f = inside(BUILD, p.slice("/__rn/build/".length));
+            return f ? sendFile(req, res, f) : json(res, 404, { error: "not built yet" });
+        }
+        if (p.startsWith("/__rn/files/")) {
+            const rel = p.slice("/__rn/files/".length);
+            if (role === "reviewer" && !/^notes\//.test(rel))
+                return json(res, 403, { error: "not shared" });
+            const f = inside(DIR, rel);
+            return f ? sendFile(req, res, f) : json(res, 404, { error: "no such file" });
+        }
+        if (p.startsWith("/__rn/public/")) {
+            const f = inside(PUBLIC, p.slice("/__rn/public/".length));
+            return f ? sendFile(req, res, f) : json(res, 404, { error: `not in your public folder: ${p.slice(13)}` });
+        }
+        if (p === "/__rn/events") {
+            if (url.searchParams.get("t") !== key)
+                return json(res, 401, { error: "bad token" });
+            res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
+            res.write(": reelnote\n\n");
+            clients.add(res);
+            const ping = setInterval(() => res.write(": ping\n\n"), 25000);
+            req.on("close", () => {
+                clearInterval(ping);
+                clients.delete(res);
+            });
+            return;
+        }
+        if (p.startsWith("/__rn/api/")) {
+            // Every API call carries the session's key, so other web pages can't trigger anything.
+            if (req.headers["x-reelnote-token"] !== key)
+                return json(res, 401, { error: "bad token" });
+            const route = p.slice("/__rn/api/".length);
+            if (role === "reviewer" && !REVIEWER_API.some(([m, re]) => m === req.method && re.test(route)))
+                return json(res, 403, { error: "Reviewers can watch and write notes only." });
+            return await api(req, res, route, url, role);
+        }
+        // anything else: the project's public folder, so absolute paths like "/logo.png" work as in the Studio
+        const f = inside(PUBLIC, p);
+        if (f)
+            return sendFile(req, res, f);
+        return json(res, 404, { error: `not found: ${p}` });
+    };
     const okHost = (host) => !!host && new RegExp(`^(localhost|127\\.0\\.0\\.1|\\[::1\\]):${PORT}$`).test(host);
     const server = http.createServer(async (req, res) => {
-        const url = new URL(req.url ?? "/", `http://localhost:${PORT}`);
-        const p = url.pathname;
         try {
             // Only this computer, by name: blocks other websites reaching the app through DNS tricks.
             if (!okHost(req.headers.host))
                 return json(res, 403, { error: "ReelNote only answers on localhost." });
-            if (p === "/" || p === "/index.html") {
-                res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
-                return res.end(index());
-            }
-            if (p === "/__rn/ping")
-                return json(res, 200, { ok: true, version: VERSION });
-            if (p.startsWith("/__rn/build/")) {
-                const f = inside(BUILD, p.slice("/__rn/build/".length));
-                return f ? sendFile(req, res, f) : json(res, 404, { error: "not built yet" });
-            }
-            if (p.startsWith("/__rn/files/")) {
-                const f = inside(DIR, p.slice("/__rn/files/".length));
-                return f ? sendFile(req, res, f) : json(res, 404, { error: "no such file" });
-            }
-            if (p.startsWith("/__rn/public/")) {
-                const f = inside(PUBLIC, p.slice("/__rn/public/".length));
-                return f ? sendFile(req, res, f) : json(res, 404, { error: `not in your public folder: ${p.slice(13)}` });
-            }
-            if (p === "/__rn/events") {
-                if (url.searchParams.get("t") !== TOKEN)
-                    return json(res, 401, { error: "bad token" });
-                res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
-                res.write(": reelnote\n\n");
-                clients.add(res);
-                const ping = setInterval(() => res.write(": ping\n\n"), 25000);
-                req.on("close", () => {
-                    clearInterval(ping);
-                    clients.delete(res);
-                });
-                return;
-            }
-            if (p.startsWith("/__rn/api/")) {
-                // Every API call carries the session token, so other web pages can't trigger anything.
-                if (req.headers["x-reelnote-token"] !== TOKEN)
-                    return json(res, 401, { error: "bad token" });
-                return await api(req, res, p.slice("/__rn/api/".length), url);
-            }
-            // anything else: the project's public folder, so absolute paths like "/logo.png" work as in the Studio
-            const f = inside(PUBLIC, p);
-            if (f)
-                return sendFile(req, res, f);
-            return json(res, 404, { error: `not found: ${p}` });
+            await handle(req, res, "owner", TOKEN);
         }
         catch (e) {
             console.error(e);
-            return json(res, 500, { error: e.message });
+            if (!res.headersSent)
+                json(res, 500, { error: e.message });
         }
     });
-    const noteById = (id) => loadNotes(ROOT).find((n) => n.id === id) ?? null;
-    const api = async (req, res, route, url) => {
+    const cookieKey = (req) => req.headers.cookie?.match(/(?:^|;\s*)rn_k=(\w+)/)?.[1] ?? null;
+    const shareHandler = async (req, res) => {
+        if (!share)
+            return json(res, 410, { error: "Sharing is off." });
+        try {
+            const url = new URL(req.url ?? "/", "http://x");
+            const k = url.searchParams.get("k");
+            const ok = k === share.key || cookieKey(req) === share.key || req.headers["x-reelnote-token"] === share.key || url.searchParams.get("t") === share.key;
+            if (!ok) {
+                res.writeHead(401, { "Content-Type": "text/html; charset=utf-8" });
+                return res.end(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><body style="font:16px system-ui;background:#0d0f1e;color:#e9ebff;padding:32px">
+          <h2>ReelNote</h2><p>This review link isn't valid any more. Ask for a new one.</p><p>এই রিভিউ লিংকটা আর কাজ করছে না। নতুন লিংক চেয়ে নিন।</p>`);
+            }
+            if (k === share.key)
+                res.setHeader("Set-Cookie", `rn_k=${share.key}; HttpOnly; SameSite=Lax; Path=/`);
+            await handle(req, res, "reviewer", share.key);
+        }
+        catch (e) {
+            console.error(e);
+            if (!res.headersSent)
+                json(res, 500, { error: e.message });
+        }
+    };
+    const startShare = async () => {
+        if (share)
+            return shareInfo();
+        const key = makeToken();
+        const srv = http.createServer(shareHandler);
+        let port = PORT + 1;
+        for (;; port++) {
+            try {
+                await new Promise((resolve, reject) => {
+                    srv.once("error", reject);
+                    srv.listen(port, "0.0.0.0", () => {
+                        srv.off("error", reject);
+                        resolve();
+                    });
+                });
+                break;
+            }
+            catch (e) {
+                if (e.code !== "EADDRINUSE" || port > PORT + 40)
+                    throw e;
+            }
+        }
+        share = { server: srv, port, key };
+        const info = shareInfo();
+        console.log(`ReelNote: sharing for review on your network:\n${info.urls.map((u) => `  ${u}`).join("\n") || "  (no network found)"}`);
+        broadcast("share", info);
+        return info;
+    };
+    const stopShare = () => {
+        if (!share)
+            return shareInfo();
+        share.server.closeAllConnections?.();
+        share.server.close();
+        share = null;
+        broadcast("share", shareInfo());
+        console.log("ReelNote: sharing stopped.");
+        return shareInfo();
+    };
+    const snap = () => {
+        try {
+            return takeSnapshot(ROOT, DIR);
+        }
+        catch {
+            return null;
+        }
+    };
+    const api = async (req, res, route, url, role) => {
         const m = req.method ?? "GET";
         if (route === "state" && m === "GET") {
             return json(res, 200, {
-                version: VERSION, project: { name: project.name, root: ROOT, entry: relative(ROOT, ENTRY) }, notes: loadNotes(ROOT), compositions,
-                render: renderState(), memory: readMemory(), settings, window: devtoolsPort !== null,
+                version: VERSION, role, project: { name: project.name, root: role === "owner" ? ROOT : null, entry: relative(ROOT, ENTRY) }, notes: loadNotes(ROOT), compositions,
+                render: role === "owner" ? renderState() : { job: null, queue: [], waiting: null, history: [] }, memory: role === "owner" ? readMemory() : null,
+                settings, props, share: role === "owner" ? shareInfo() : null, window: devtoolsPort !== null,
             });
         }
         if (route === "settings" && m === "PUT") {
             const b = await body(req);
-            settings = { lang: b.lang === "bn" ? "bn" : b.lang === "en" ? "en" : settings.lang, render: b.render ? cleanSettings(b.render) : settings.render };
+            settings = {
+                lang: b.lang === "bn" ? "bn" : b.lang === "en" ? "en" : settings.lang,
+                render: b.render ? cleanSettings(b.render) : settings.render,
+                thumbs: typeof b.thumbs === "boolean" ? b.thumbs : settings.thumbs,
+            };
             writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2));
             return json(res, 200, settings);
+        }
+        if (route === "props" && m === "GET")
+            return json(res, 200, props);
+        if (route === "props" && m === "PUT") {
+            const b = await body(req);
+            const id = String(b.composition ?? "");
+            if (!id)
+                return json(res, 400, { error: "Which composition?" });
+            if (!b.props || typeof b.props !== "object" || !Object.keys(b.props).length)
+                delete props[id];
+            else
+                props[id] = b.props;
+            writeFileSync(PROPS_FILE, JSON.stringify(props, null, 2));
+            broadcast("props", props);
+            return json(res, 200, props);
         }
         if (route === "compositions" && m === "GET")
             return json(res, 200, compositions);
@@ -328,27 +446,50 @@ export const startApp = async (o) => {
             const id = nextId(loadNotes(ROOT)); // confirmed (or moved on) when the note is saved below
             const pad = String(id).padStart(3, "0");
             const kind = b.kind === "audio" ? "audio" : "visual";
-            const marks = kind === "visual" && Array.isArray(b.marks) ? b.marks : [];
+            const marks = kind === "visual" && Array.isArray(b.marks) ? b.marks.slice(0, 50) : [];
             const frame = Math.max(0, Math.round(Number(b.frame) || 0));
-            const endFrame = b.endFrame === null || b.endFrame === undefined || Number(b.endFrame) === frame ? null : Math.round(Number(b.endFrame));
-            const clean = `notes/n${pad}-clean.png`;
-            await capturer.capture({ composition: b.composition, frame, file: join(DIR, clean) });
+            let endFrame = b.endFrame === null || b.endFrame === undefined || Number(b.endFrame) <= frame ? null : Math.round(Number(b.endFrame));
+            if (endFrame !== null && comp)
+                endFrame = Math.min(endFrame, comp.durationInFrames - 1);
+            const warnings = [];
+            let clean = `notes/n${pad}-clean.png`;
             let image = clean;
-            if (marks.length) {
-                image = `notes/n${pad}.png`;
-                await capturer.capture({ composition: b.composition, frame, marks, file: join(DIR, image) });
+            let strip = null;
+            // pictures are a bonus: a note is kept even if the window can't take them
+            try {
+                await capturer.capture({ composition: b.composition, frame, file: join(DIR, clean) });
+                if (marks.length) {
+                    image = `notes/n${pad}.png`;
+                    await capturer.capture({ composition: b.composition, frame, marks, file: join(DIR, image) });
+                }
+                if (endFrame !== null) {
+                    strip = `notes/n${pad}-strip.png`;
+                    await capturer.strip({ composition: b.composition, from: frame, to: endFrame, file: join(DIR, strip) });
+                }
             }
+            catch (e) {
+                warnings.push(`No picture: ${e.message}`);
+                if (!existsSync(join(DIR, clean)))
+                    clean = image = null;
+                else if (image && !existsSync(join(DIR, image)))
+                    image = clean;
+                if (strip && !existsSync(join(DIR, strip)))
+                    strip = null;
+            }
+            const author = role === "reviewer" ? String(b.author ?? "").trim().slice(0, 40) || "Reviewer" : null;
+            const p = props[String(b.composition)];
+            const createdSnap = snap();
             const note = updateNotes(ROOT, (notes) => {
                 const n = {
-                    id: notes.some((x) => x.id === id) ? nextId(notes) : id, composition: String(b.composition), frame,
-                    endFrame: endFrame !== null && endFrame < frame ? null : endFrame, fps: Number(b.fps ?? comp?.fps ?? 30),
-                    width: Number(b.width ?? comp?.width ?? 0), height: Number(b.height ?? comp?.height ?? 0), kind,
-                    text: String(b.text ?? "").trim(), marks, image, clean, status: "open", replies: [], created: new Date().toISOString(), fixed: null,
+                    id: notes.some((x) => x.id === id) ? nextId(notes) : id, composition: String(b.composition), frame, endFrame,
+                    fps: Number(b.fps ?? comp?.fps ?? 30), width: Number(b.width ?? comp?.width ?? 0), height: Number(b.height ?? comp?.height ?? 0), kind,
+                    text: String(b.text ?? "").trim().slice(0, 4000), marks, image, clean, strip, status: "open", replies: [], created: new Date().toISOString(), fixed: null,
+                    author, props: p && Object.keys(p).length ? p : null, createdSnap, baseline: null, fix: null,
                 };
                 return { notes: [...notes, n], result: n };
             });
             broadcast("notes", loadNotes(ROOT));
-            return json(res, 200, note);
+            return json(res, 200, { ...note, warnings });
         }
         const one = route.match(/^notes\/(\d+)$/);
         if (one && m === "PATCH") {
@@ -364,6 +505,8 @@ export const startApp = async (o) => {
                     if (b.endFrame !== undefined)
                         u.endFrame = b.endFrame === null || Number(b.endFrame) <= n.frame ? null : Math.round(Number(b.endFrame));
                     if (b.status === "open" || b.status === "fixed") {
+                        if (b.status === "open" && n.status === "fixed")
+                            u.baseline = null; // Claude starts afresh
                         u.status = b.status;
                         u.fixed = b.status === "fixed" ? new Date().toISOString() : null;
                     }
@@ -378,11 +521,15 @@ export const startApp = async (o) => {
         if (rep && m === "POST") {
             const b = await body(req);
             const id = Number(rep[1]);
-            const text = String(b.text ?? "").trim();
+            const text = String(b.text ?? "").trim().slice(0, 4000);
             if (!text)
                 return json(res, 400, { error: "Empty reply" });
+            const name = role === "reviewer" ? String(b.author ?? "").trim().slice(0, 40) || "Reviewer" : undefined;
             const note = updateNotes(ROOT, (notes) => {
-                const next = notes.map((n) => n.id === id ? { ...n, replies: [...n.replies, { by: "you", text, at: new Date().toISOString() }], ...(b.reopen ? { status: "open", fixed: null } : {}) } : n);
+                const next = notes.map((n) => n.id === id ? {
+                    ...n, replies: [...n.replies, { by: "you", text, at: new Date().toISOString(), ...(name ? { name } : {}) }],
+                    ...(b.reopen && role === "owner" ? { status: "open", fixed: null, baseline: null } : {}),
+                } : n);
                 return { notes: next, result: next.find((n) => n.id === id) ?? null };
             });
             broadcast("notes", loadNotes(ROOT));
@@ -391,17 +538,54 @@ export const startApp = async (o) => {
         if (one && m === "DELETE") {
             const id = Number(one[1]);
             const gone = updateNotes(ROOT, (notes) => ({ notes: notes.filter((n) => n.id !== id), result: notes.find((n) => n.id === id) ?? null }));
-            for (const f of [gone?.image, gone?.clean])
+            for (const f of [gone?.image, gone?.clean, gone?.strip])
                 if (f)
                     rmSync(join(DIR, f), { force: true });
             broadcast("notes", loadNotes(ROOT));
             return json(res, 200, { ok: true });
+        }
+        const ch = route.match(/^notes\/(\d+)\/changes$/);
+        if (ch && m === "GET") {
+            const n = loadNotes(ROOT).find((x) => x.id === Number(ch[1]));
+            if (!n?.fix)
+                return json(res, 404, { error: "Claude hasn't recorded a change for this note." });
+            return json(res, 200, { ...diffSnapshots(DIR, n.fix.from, n.fix.to), undone: n.fix.undone });
+        }
+        const un = route.match(/^notes\/(\d+)\/undo$/);
+        if (un && m === "POST") {
+            const id = Number(un[1]);
+            const n = loadNotes(ROOT).find((x) => x.id === id);
+            if (!n?.fix)
+                return json(res, 404, { error: "Nothing to undo." });
+            if (n.fix.undone)
+                return json(res, 409, { error: "Already undone." });
+            const files = undoFix(ROOT, DIR, n.fix.from, n.fix.to);
+            const note = updateNotes(ROOT, (notes) => {
+                const next = notes.map((x) => x.id !== id ? x : {
+                    ...x, status: "open", fixed: null, baseline: null, fix: { ...x.fix, undone: true },
+                    replies: [...x.replies, { by: "you", text: `Undid Claude's change (${files.join(", ")}).`, at: new Date().toISOString() }],
+                });
+                return { notes: next, result: next.find((x) => x.id === id) };
+            });
+            broadcast("notes", loadNotes(ROOT));
+            return json(res, 200, note);
         }
         if (route === "capture" && m === "POST") {
             const b = await body(req);
             const file = join(DIR, "frames", `${safeName(String(b.composition))}-${Math.round(Number(b.frame))}-${Date.now().toString(36)}.png`);
             await capturer.capture({ composition: String(b.composition), frame: Math.round(Number(b.frame)), file, width: b.width });
             return json(res, 200, { image: file, url: `/__rn/files/${relative(DIR, file).split("\\").join("/")}` });
+        }
+        if (route === "strip" && m === "POST") {
+            const b = await body(req);
+            const comp = compositions.find((c) => c.id === b.composition);
+            const from = Math.max(0, Math.round(Number(b.from) || 0));
+            const to = Math.max(from, Math.round(Number(b.to ?? from)));
+            if (comp && to >= comp.durationInFrames)
+                return json(res, 400, { error: `${comp.id} has frames 0–${comp.durationInFrames - 1}.` });
+            const file = join(DIR, "frames", `${safeName(String(b.composition))}-${from}-${to}-strip-${Date.now().toString(36)}.png`);
+            const r = await capturer.strip({ composition: String(b.composition), from, to, count: Math.min(16, Math.max(2, Number(b.count) || 12)), file });
+            return json(res, 200, { image: r.file, frames: r.frames });
         }
         if (route === "render" && m === "GET")
             return json(res, 200, renderState());
@@ -417,6 +601,22 @@ export const startApp = async (o) => {
         if (route === "render/cancel" && m === "POST") {
             running?.cancel();
             return json(res, 200, { ok: true });
+        }
+        if (route === "render/diff" && m === "POST") {
+            const b = await body(req);
+            const rec = b.id ? history.find((h) => h.id === b.id)
+                : [...history].reverse().find((h) => h.composition === b.composition && h.kind === "video" && h.status === "done" && h.previous);
+            if (!rec)
+                return json(res, 404, { error: "No finished render with an earlier one to compare." });
+            if (!rec.previous || !existsSync(join(ROOT, rec.previous)))
+                return json(res, 404, { error: "The earlier render isn't kept any more (cleaned up?)." });
+            if (!existsSync(join(ROOT, rec.out)))
+                return json(res, 404, { error: "This render's file is gone." });
+            const d = await diffVideos({ root: ROOT, before: join(ROOT, rec.previous), after: join(ROOT, rec.out) });
+            rec.diff = { ...d, at: new Date().toISOString() };
+            saveHistory();
+            broadcast("render", renderState());
+            return json(res, 200, { ...rec.diff, composition: rec.composition, out: rec.out, previous: rec.previous });
         }
         const q = route.match(/^render\/queue\/([\w-]+)$/);
         if (q && m === "DELETE") {
@@ -457,6 +657,12 @@ export const startApp = async (o) => {
             reveal(f);
             return json(res, 200, { ok: true });
         }
+        if (route === "share" && m === "GET")
+            return json(res, 200, shareInfo());
+        if (route === "share" && m === "POST") {
+            const b = await body(req);
+            return json(res, 200, b.on ? await startShare() : stopShare());
+        }
         if (route === "cleanup" && m === "GET") {
             const items = findLeftovers(DIR);
             return json(res, 200, { bytes: items.reduce((a, i) => a + i.bytes, 0), count: items.length });
@@ -464,7 +670,15 @@ export const startApp = async (o) => {
         if (route === "cleanup" && m === "POST") {
             if (busy() || remotionRunning())
                 return json(res, 409, { error: "A render is running. Clean up when it's done." });
-            return json(res, 200, { freed: removeLeftovers(findLeftovers(DIR)) });
+            let freed = removeLeftovers(findLeftovers(DIR));
+            // copies of the project no note needs any more
+            const keep = new Set();
+            for (const n of loadNotes(ROOT))
+                for (const s of [n.createdSnap, n.baseline, n.fix?.from, n.fix?.to])
+                    if (s)
+                        keep.add(s);
+            freed += pruneSnapshots(DIR, keep);
+            return json(res, 200, { freed });
         }
         if (route === "memory")
             return json(res, 200, readMemory());
@@ -527,6 +741,8 @@ export const startApp = async (o) => {
     writeFileSync(SERVER_FILE, JSON.stringify(info, null, 2), { mode: 0o600 });
     const appUrl = `http://localhost:${PORT}/`;
     console.log(`ReelNote ${VERSION} · ${project.name}\n  film:  ${relative(ROOT, ENTRY)}\n  app:   ${appUrl}\n  notes: ${join(DIR, "notes.json")}`);
+    if (o.share)
+        await startShare().catch((e) => console.warn(`ReelNote: couldn't start sharing: ${e.message}`));
     let stopping = false;
     const shutdown = async () => {
         if (stopping)
@@ -540,6 +756,7 @@ export const startApp = async (o) => {
         catch {
             /* already gone */
         }
+        stopShare();
         running?.cancel();
         capturer.close();
         for (const w of watchers)

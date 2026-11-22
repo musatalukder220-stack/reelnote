@@ -1,5 +1,4 @@
 // Boot: load the film's entry (it calls registerRoot), find its compositions, show the app.
-import "./style.css";
 import React from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";

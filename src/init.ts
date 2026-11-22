@@ -1,8 +1,14 @@
 // `reelnote init`: connects ReelNote to Claude Code in this project (.mcp.json + .claude/settings.json).
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { findEntry, findProject, resolveFromProject } from "./project.js";
-import { PKG_ROOT } from "./util.js";
+import { PKG_ROOT, VERSION } from "./util.js";
+
+export const REPO = "github:musatalukder220-stack/reelnote";
+
+// Run through `npx github:…`, ReelNote lives in npm's temporary cache, which can be cleared at any time.
+// So init keeps a copy inside the project (.reelnote/app, ignored by git) for Claude Code to start.
+export const isTemporaryCopy = (dir = PKG_ROOT) => /[\\/]_npx[\\/]/.test(dir);
 
 const readJson = (f: string): Record<string, any> => {
   if (!existsSync(f)) return {};
@@ -17,7 +23,17 @@ export const runInit = (projectArg?: string) => {
   const project = findProject(projectArg ?? process.cwd());
   if (!project) throw new Error("No Remotion project here (no package.json that depends on remotion).");
   const root = project.root;
-  const cli = join(PKG_ROOT, "dist", "cli.js");
+  let cli = join(PKG_ROOT, "dist", "cli.js");
+  if (isTemporaryCopy()) {
+    const app = join(root, ".reelnote", "app");
+    rmSync(app, { recursive: true, force: true });
+    mkdirSync(app, { recursive: true });
+    for (const part of ["dist", "client", "package.json", "LICENSE"]) {
+      if (existsSync(join(PKG_ROOT, part))) cpSync(join(PKG_ROOT, part), join(app, part), { recursive: true });
+    }
+    if (!existsSync(join(root, ".reelnote", ".gitignore"))) writeFileSync(join(root, ".reelnote", ".gitignore"), "*\n");
+    cli = join(app, "dist", "cli.js");
+  }
   // absolute paths: Claude Code may start MCP servers from another folder. Moving the project? Run init again.
   const local = !relative(root, PKG_ROOT).startsWith("..") && relative(root, PKG_ROOT).split(sep)[0] === "node_modules";
   const server = { command: "node", args: [cli, "mcp", "--project", root] };
@@ -39,8 +55,8 @@ export const runInit = (projectArg?: string) => {
   if (!resolveFromProject(root, "@remotion/player/package.json")) notes.push("Install the player once:  npx remotion add @remotion/player");
   if (!existsSync(join(root, "node_modules"))) notes.push("Install the project's packages:  npm install");
   if (!findEntry(root)) notes.push("Couldn't find your entry file (src/index.ts). Start ReelNote with --entry <file>.");
-  const start = local ? "npx reelnote" : `node ${cli}`;
-  console.log(`ReelNote is connected to Claude Code in ${project.name}.
+  const start = local ? "npx reelnote" : isTemporaryCopy() ? `npx ${REPO}   (or, offline: node ${relative(root, cli)})` : `node ${cli}`;
+  console.log(`ReelNote ${VERSION} is connected to Claude Code in ${project.name}.
   wrote  .mcp.json (server "reelnote")
   wrote  .claude/settings.json (tools allowed without prompts)
 ${notes.map((n) => `  ! ${n}`).join("\n")}${notes.length ? "\n" : ""}

@@ -4,13 +4,14 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { dataDir, loadNotes, noteSummary, updateNotes } from "./notes.js";
+import { diffSnapshots, takeSnapshot } from "./snapshots.js";
 import { findProject } from "./project.js";
 import type { AudioCheck, CompositionInfo, Issue, Job, ServerInfo } from "./types.js";
 import { safeName, timecode, VERSION } from "./util.js";
 
 const INSTRUCTIONS = `ReelNote holds review notes for this Remotion video. A note is a frame (or a stretch of frames), the user's words and a picture of the frame with what they marked (circles, boxes, arrows, freehand). Sound notes are about the audio in that stretch.
-Work through notes like this: reelnote_notes to list the open ones, reelnote_note to see one, fix the code, then reelnote_compare (the picture before vs the live frame now; the preview reloads by itself when code changes) or reelnote_frame for any other frame. When it's right, reelnote_note_update with status "fixed" and a one-line reply saying what you changed. If a note is unclear, ask with reelnote_reply instead of guessing.
-Never render the whole video to check a fix: reelnote_frame and reelnote_compare show it without rendering. For sound, reelnote_audio gives loudness, silent gaps and clipping. When every note is fixed, reelnote_render makes the final video once and checks every frame and the sound.`;
+Work through notes one at a time: reelnote_notes to list the open ones, reelnote_note to see one (this also starts tracking what you change for it), fix the code, then reelnote_compare (the picture before vs the live frame now; the preview reloads by itself when code changes) or reelnote_frame for any other frame. For motion or timing notes over a range of frames, reelnote_strip shows many frames side by side. When it's right, reelnote_note_update with status "fixed" and a one-line reply saying what you changed; ReelNote records the files you changed so the user can review or undo them. If a note is unclear, ask with reelnote_reply instead of guessing. Notes may come from reviewers (named in the note).
+Never render the whole video to check a fix: reelnote_frame, reelnote_strip and reelnote_compare show it without rendering. For sound, reelnote_audio gives loudness in LUFS (YouTube aims for -14), silent gaps and clipping. When every note is fixed, reelnote_render makes the final video once and checks every frame and the sound; after a second render, reelnote_render_diff shows which frames changed.`;
 
 const TOOLS = [
   {
@@ -32,6 +33,24 @@ const TOOLS = [
     inputSchema: { type: "object", properties: {
       composition: { type: "string", description: "Composition id" }, frame: { type: "number", description: "Frame number (0-based)" },
     }, required: ["composition", "frame"] },
+  },
+  {
+    name: "reelnote_strip",
+    description: "A filmstrip: several frames of a range side by side in one picture, from the live preview. Use it to judge motion, timing and transitions. Needs the ReelNote window.",
+    inputSchema: { type: "object", properties: {
+      composition: { type: "string" }, from: { type: "number", description: "First frame" }, to: { type: "number", description: "Last frame" },
+      count: { type: "number", description: "How many frames (2–16, default 12)" },
+    }, required: ["composition", "from", "to"] },
+  },
+  {
+    name: "reelnote_changes",
+    description: "The code changes recorded for a fixed note (a diff), and whether the user undid them.",
+    inputSchema: { type: "object", properties: { id: { type: "number" } }, required: ["id"] },
+  },
+  {
+    name: "reelnote_render_diff",
+    description: "Compare the latest render of a composition with the one before it, frame by frame: which stretches changed. Use it to make sure a fix didn't change anything else.",
+    inputSchema: { type: "object", properties: { composition: { type: "string" } }, required: ["composition"] },
   },
   {
     name: "reelnote_compare",
@@ -110,7 +129,7 @@ export const fmtJob = (j: Job | null) => {
         if (j.video.issues.length) lines.push(issueLines(j.video.issues));
       }
       if (j.audio) {
-        lines.push(j.audio.hasAudio ? `Sound: average ${j.audio.rmsDb ?? "–"} dB, peak ${j.audio.peakDb ?? "–"} dB.` : "Sound: none.");
+        lines.push(j.audio.hasAudio ? `Sound: ${j.audio.lufs ?? "–"} LUFS, peak ${j.audio.peakDb ?? "–"} dBFS.` : "Sound: none.");
         if (j.audio.issues.length) lines.push(issueLines(j.audio.issues));
       }
       return lines.join("\n");
@@ -125,7 +144,7 @@ export const fmtJob = (j: Job | null) => {
 
 export const fmtAudio = (comp: string, a: AudioCheck & { made?: string }) => {
   if (!a.hasAudio) return `${comp} has no sound.`;
-  const lines = [`Sound of ${comp}${a.made ? ` (analysed ${new Date(a.made).toLocaleTimeString("en-GB")})` : ""}: ${a.frames} frames, average ${a.rmsDb ?? "–"} dB, peak ${a.peakDb ?? "–"} dB.`];
+  const lines = [`Sound of ${comp}${a.made ? ` (analysed ${new Date(a.made).toLocaleTimeString("en-GB")})` : ""}: ${a.frames} frames, loudness ${a.lufs ?? "–"} LUFS, peak ${a.peakDb ?? "–"} dBFS.`];
   // a coarse picture of loudness: one character per second
   const per = Math.max(1, Math.round(a.fps));
   const bars = " ▁▂▃▄▅▆▇█";
@@ -194,8 +213,40 @@ export const startMcp = (projectArg?: string) => {
           const n = notes.find((x) => x.id === Number(a.id));
           if (!n) return err(`No note #${a.id}.`);
           await activity(`Claude is looking at note #${n.id}`);
+          // remember the project as it is now, so the change for this note can be shown (and undone) later
+          if (n.status === "open" && !n.baseline) {
+            try {
+              const base = takeSnapshot(ROOT, dir);
+              updateNotes(ROOT, (all) => ({ notes: all.map((x) => (x.id === n.id ? { ...x, baseline: base } : x)), result: null }));
+            } catch {
+              /* tracking is a bonus */
+            }
+          }
           const file = n.image ? join(dir, n.image) : null;
-          return { content: [text(noteSummary(n)), ...(file && existsSync(file) ? [image(file)] : [text("(picture missing)")])] };
+          const strip = n.strip ? join(dir, n.strip) : null;
+          return { content: [
+            text(noteSummary(n)), ...(file && existsSync(file) ? [image(file)] : [text("(picture missing)")]),
+            ...(strip && existsSync(strip) ? [text(`Filmstrip of frames ${n.frame}–${n.endFrame} (left to right, top to bottom):`), image(strip)] : []),
+          ] };
+        }
+        case "reelnote_strip": {
+          const r = await call<{ image: string; frames: number[] }>("strip", { body: { composition: a.composition, from: Number(a.from), to: Number(a.to), count: a.count } });
+          await activity(`Claude looked at frames ${a.from}–${a.to}`);
+          return { content: [text(`${a.composition} · frames ${r.frames.join(", ")} (live preview, left to right, top to bottom)`), image(r.image)] };
+        }
+        case "reelnote_changes": {
+          const n = notes.find((x) => x.id === Number(a.id));
+          if (!n) return err(`No note #${a.id}.`);
+          if (!n.fix) return err(`No change recorded for #${n.id}.`);
+          const d = diffSnapshots(dir, n.fix.from, n.fix.to);
+          return { content: [text(`Changes for #${n.id}${n.fix.undone ? " (the user UNDID these)" : ""}:\n${d.files.map((f) => `${f.path} +${f.added} −${f.removed}`).join("\n") || "no files"}\n\n${d.patch.slice(0, 20000)}`)] };
+        }
+        case "reelnote_render_diff": {
+          const r = await call<{ frames: [number, number]; changed: { from: number; to: number; amount: number }[]; out: string; previous: string }>("render/diff", { body: { composition: a.composition } });
+          const lines = [`${a.composition}: ${r.previous} → ${r.out}`];
+          if (r.frames[0] !== r.frames[1]) lines.push(`Frame count changed: ${r.frames[0]} → ${r.frames[1]}`);
+          lines.push(r.changed.length ? `Changed frames: ${r.changed.map((c) => (c.from === c.to ? `${c.from}` : `${c.from}–${c.to}`)).join(", ")}` : "No frames changed.");
+          return { content: [text(lines.join("\n"))] };
         }
         case "reelnote_frame": {
           const r = await call<{ image: string }>("capture", { body: { composition: a.composition, frame: Number(a.frame) } });
@@ -208,25 +259,48 @@ export const startMcp = (projectArg?: string) => {
           const before = n.clean ?? n.image;
           const r = await call<{ image: string }>("capture", { body: { composition: n.composition, frame: n.frame } });
           await activity(`Claude compared note #${n.id} before and after`);
+          const strips: Content[] = [];
+          if (n.endFrame !== null && n.strip && existsSync(join(dir, n.strip))) {
+            const now = await call<{ image: string }>("strip", { body: { composition: n.composition, from: n.frame, to: n.endFrame } });
+            strips.push(text(`BEFORE, frames ${n.frame}–${n.endFrame}:`), image(join(dir, n.strip)), text("NOW, same frames:"), image(now.image));
+          }
           return { content: [
             text(`${noteSummary(n)}\n\nBEFORE (when the note was written${n.marks.length ? "; the marks are on the picture from reelnote_note" : ""}):`),
             ...(before && existsSync(join(dir, before)) ? [image(join(dir, before))] : [text("(picture missing)")]),
-            text("NOW (live preview):"), image(r.image),
+            text("NOW (live preview):"), image(r.image), ...strips,
           ] };
         }
         case "reelnote_note_update": {
           const id = Number(a.id);
           if (!notes.some((n) => n.id === id)) return err(`No note #${id}.`);
           const status = a.status === "open" ? "open" : "fixed";
+          // what changed in the project since Claude started on this note
+          const was = notes.find((n) => n.id === id)!;
+          let fix = was.fix;
+          let changed = "";
+          if (status === "fixed") {
+            const from = was.baseline ?? was.createdSnap;
+            if (from) {
+              try {
+                const to = takeSnapshot(ROOT, dir);
+                const d = diffSnapshots(dir, from, to);
+                fix = { from, to, files: d.files, at: new Date().toISOString(), undone: false };
+                changed = d.files.length ? ` Recorded changes: ${d.files.map((f) => f.path).join(", ")}.` : " No file changed since you started on it.";
+              } catch {
+                /* tracking is a bonus */
+              }
+            }
+          }
           const left = updateNotes(ROOT, (all) => {
             const next = all.map((n) => n.id !== id ? n : {
-              ...n, status: status as "open" | "fixed", fixed: status === "fixed" ? new Date().toISOString() : null,
+              ...n, status: status as "open" | "fixed", fixed: status === "fixed" ? new Date().toISOString() : null, fix,
+              baseline: status === "open" ? null : n.baseline,
               replies: a.reply ? [...n.replies, { by: "claude" as const, text: String(a.reply), at: new Date().toISOString() }] : n.replies,
             });
             return { notes: next, result: next.filter((n) => n.status === "open").length };
           });
           await activity(`Claude marked #${id} ${status}`);
-          return { content: [text(`Note #${id} is ${status}. ${left} open note(s) left.`)] };
+          return { content: [text(`Note #${id} is ${status}.${changed} ${left} open note(s) left.`)] };
         }
         case "reelnote_reply": {
           const id = Number(a.id);

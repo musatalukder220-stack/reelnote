@@ -34,7 +34,8 @@ export const collectCompositions = async (): Promise<Comp[]> => {
       return Number.isFinite(v) && v > 0 ? v : def;
     };
     out.push({
-      id: c.id, folder: c.folder, still: c.still, component: c.component, lazyComponent: c.lazyComponent, props, error,
+      id: c.id, folder: c.folder, still: c.still, component: c.component, lazyComponent: c.lazyComponent, props, defaults: props, error,
+      calc: c.calculateMetadata,
       durationInFrames: c.still ? 1 : Math.round(num("durationInFrames", 1)), fps: num("fps", 30), width: Math.round(num("width", 1920)), height: Math.round(num("height", 1080)),
     });
   }

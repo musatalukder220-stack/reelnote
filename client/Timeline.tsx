@@ -1,11 +1,12 @@
 // The timeline under the picture: playhead, notes (pins and ranges), the selected range, the sound and render problems.
 import React, { useEffect, useRef, useState } from "react";
 import { useT } from "./i18n";
-import type { Issue, Note } from "./types";
+import { LiveThumb } from "./LiveThumb";
+import type { Comp, Issue, Note } from "./types";
 
 type Props = {
   duration: number; fps: number; frame: number; notes: Note[]; selected: number | null; range: [number, number] | null;
-  peaks: number[] | null; issues: Issue[]; waveBusy: boolean;
+  peaks: number[] | null; issues: Issue[]; waveBusy: boolean; comp: Comp; thumbs: boolean; canWave: boolean;
   onSeek: (f: number) => void; onScrub: (on: boolean) => void; onRange: (r: [number, number] | null) => void; onPick: (id: number) => void; onWave: () => void;
 };
 
@@ -84,8 +85,16 @@ export const Timeline: React.FC<Props> = (p) => {
   const ticks: number[] = [];
   for (let s = 0; s <= seconds + 1e-6; s += step) ticks.push(s);
 
+  const nThumbs = Math.max(2, Math.min(14, Math.floor(width / 96)));
+  const thumbFrames = Array.from({ length: nThumbs }, (_, i) => Math.round((i * last) / (nThumbs - 1)));
+
   return (
     <div className="timeline">
+      {p.thumbs && p.duration > 1 && (
+        <div className="tl-thumbs" key={`${p.comp.id}-${nThumbs}`}>
+          {thumbFrames.map((f, i) => <div key={i} className="tl-thumb" onClick={() => p.onSeek(f)}><LiveThumb comp={p.comp} frame={f} delay={120 * i} /></div>)}
+        </div>
+      )}
       <div className="tl-ruler">
         {ticks.map((s) => (
           <span key={s} style={{ left: pct(s * p.fps) }}>{s >= 60 ? `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, "0")}` : `${s}s`}</span>
@@ -93,7 +102,7 @@ export const Timeline: React.FC<Props> = (p) => {
       </div>
       <div className="tl-track" ref={track} onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up} title="Shift + drag: select a range">
         <canvas ref={canvas} className="tl-wave" style={{ width: "100%", height: 34 }} />
-        {!p.peaks && (
+        {!p.peaks && p.canWave && (
           <button className="tl-wave-btn" onClick={p.onWave} disabled={p.waveBusy}>{p.waveBusy ? t.waveformBuilding : `♪ ${t.waveform}`}</button>
         )}
         {p.range && <div className="tl-range" style={{ left: pct(p.range[0]), width: `calc(${pct(p.range[1])} - ${pct(p.range[0])})` }} />}
